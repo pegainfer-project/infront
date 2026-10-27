@@ -27,6 +27,7 @@ use log::debug;
 use log::warn;
 use serde_json::Value;
 use serde_json::json;
+use vllm_server::DEFAULT_REQUEST_BODY_LIMIT_BYTES;
 
 use crate::history;
 use crate::history::Boundary;
@@ -34,11 +35,13 @@ use crate::history::Boundary;
 const COMPLETIONS_PATH: &str = "/v1/completions";
 const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
-/// The body is buffered to be inspected, and an oversized request must not be
-/// silently truncated.
-const BODY_LIMIT: usize = 128 * 1024 * 1024;
+/// The body is buffered to be inspected under the same bound the routes
+/// enforce, so an oversized request is refused before it is parsed.
+const BODY_LIMIT: usize = DEFAULT_REQUEST_BODY_LIMIT_BYTES;
 
-const LOGPROBS: [&str; 3] = ["logprobs", "top_logprobs", "prompt_logprobs"];
+/// `top_logprobs` is absent: alternatives come only with `logprobs`, and the
+/// routes reject a non-zero `top_logprobs` without it.
+const LOGPROBS: [&str; 2] = ["logprobs", "prompt_logprobs"];
 
 /// Below this a temperature is greedy, as [`infront_engine::SamplingParams`]
 /// reads it.
@@ -49,7 +52,7 @@ const GREEDY_BELOW: f64 = 1e-5;
 /// The default serves everything.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
-    /// `logprobs`, `top_logprobs` and `prompt_logprobs`.
+    /// `logprobs` (with any `top_logprobs`) and `prompt_logprobs`.
     pub logprobs: bool,
     /// Drawing at a non-greedy temperature.
     pub sampling: bool,
@@ -200,17 +203,23 @@ fn body_read_error(error: AxumError) -> Response {
     error_response(status, &message)
 }
 
-/// The OpenAI-style JSON envelope the upstream routes answer with
-/// (`vllm_server`'s `ApiError::to_error_response`, which is not exported).
+/// The JSON envelope the upstream routes answer with (`vllm_server`'s
+/// `ApiError::to_error_response`, which is not exported): `type` is the error
+/// class for a 400 and the status name otherwise, as the Python frontend
+/// reports them, and `code` is the status.
 fn error_response(status: StatusCode, message: &str) -> Response {
+    let error_type = match status {
+        StatusCode::BAD_REQUEST => "BadRequestError",
+        other => other.canonical_reason().unwrap_or("Error"),
+    };
     (
         status,
         Json(json!({
             "error": {
                 "message": message,
-                "type": "invalid_request_error",
+                "type": error_type,
                 "param": null,
-                "code": "invalid_request_error",
+                "code": status.as_u16(),
             }
         })),
     )
@@ -260,13 +269,14 @@ mod tests {
         (status, bytes)
     }
 
-    fn error_message(bytes: &Bytes) -> String {
+    fn error_message(status: StatusCode, bytes: &Bytes) -> String {
         let body: Value = serde_json::from_slice(bytes).expect("the OpenAI error envelope");
-        assert_eq!(
-            body["error"]["type"],
-            json!("invalid_request_error"),
-            "{body}"
-        );
+        assert_eq!(body["error"]["code"], json!(status.as_u16()), "{body}");
+        let expected_type = match status {
+            StatusCode::BAD_REQUEST => "BadRequestError",
+            _ => "Payload Too Large",
+        };
+        assert_eq!(body["error"]["type"], json!(expected_type), "{body}");
         body["error"]["message"]
             .as_str()
             .expect("an error message")
@@ -284,6 +294,7 @@ mod tests {
             assert_eq!(refusal(json!({ key: null })), None);
             assert_eq!(refusal(json!({ key: false })), None);
         }
+        assert_eq!(refusal(json!({"top_logprobs": 0})), None);
         assert_eq!(
             Capabilities::default().refusal(&json!({"logprobs": 5})),
             None
@@ -315,7 +326,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-            assert!(error_message(&bytes).contains("logprobs"), "{path}");
+            assert!(error_message(status, &bytes).contains("logprobs"), "{path}");
         }
     }
 
@@ -367,7 +378,7 @@ mod tests {
         );
         let (status, bytes) = post(GREEDY_ONLY, None, CHAT_COMPLETIONS_PATH, body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(error_message(&bytes).contains("length limit exceeded"));
+        assert!(error_message(status, &bytes).contains("length limit exceeded"));
     }
 
     #[tokio::test]
@@ -382,6 +393,8 @@ mod tests {
         let body = Body::from_stream(futures::stream::iter(frames));
         let (status, bytes) = post(GREEDY_ONLY, None, CHAT_COMPLETIONS_PATH, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(error_message(&bytes).contains("connection closed before the body completed"));
+        assert!(
+            error_message(status, &bytes).contains("connection closed before the body completed")
+        );
     }
 }

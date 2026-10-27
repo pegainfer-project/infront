@@ -32,10 +32,10 @@ zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206
 ] }
 
 # vLLM's Rust frontend. Keep every crate on the same rev.
-vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "fce64bc5c2c939a4521bfb9b462c8c74c1c13893" }
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "fce64bc5c2c939a4521bfb9b462c8c74c1c13893" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "fce64bc5c2c939a4521bfb9b462c8c74c1c13893" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "fce64bc5c2c939a4521bfb9b462c8c74c1c13893" }
+vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -2 }
