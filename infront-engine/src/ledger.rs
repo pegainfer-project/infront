@@ -310,30 +310,25 @@ impl RequestLedger {
 
 /// The teardown sweep: accounts still open when the ledger falls are engine
 /// bugs or teardown races, and each must surface as a finished stream instead
-/// of a client hang.
+/// of a client hang. The step's buffered records ship too, so a request the
+/// scheduler answered before a panic keeps its real terminal.
 impl Drop for RequestLedger {
     fn drop(&mut self) {
-        if self.accounts.is_empty() {
-            return;
+        for (id, account) in self.accounts.drain() {
+            let message = match account.state {
+                AccountState::Queued => "request dropped by the engine before it was answered",
+                AccountState::Active { .. } => "request dropped by the engine mid-stream",
+            };
+            self.statement.entry(id).terminal = Some(Terminal::Failed {
+                message: message.to_string(),
+                prompt_tokens: account.prompt_len,
+                completion_tokens: account.completion_tokens(),
+            });
         }
-        let updates = self
-            .accounts
-            .drain()
-            .map(|(id, account)| {
-                let message = match account.state {
-                    AccountState::Queued => "request dropped by the engine before it was answered",
-                    AccountState::Active { .. } => "request dropped by the engine mid-stream",
-                };
-                let mut update = RequestUpdate::empty(id);
-                update.terminal = Some(Terminal::Failed {
-                    message: message.to_string(),
-                    prompt_tokens: account.prompt_len,
-                    completion_tokens: account.completion_tokens(),
-                });
-                update
-            })
-            .collect();
-        let _ = self.tx.send(StepOutputs { updates });
+        let updates = self.statement.take_updates();
+        if !updates.is_empty() {
+            let _ = self.tx.send(StepOutputs { updates });
+        }
     }
 }
 

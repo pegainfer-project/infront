@@ -10,6 +10,7 @@ use infront_engine::PrefixCacheCounters;
 use infront_engine::SchedulerMetrics;
 use infront_engine::SpecDecodeCounters;
 use log::info;
+use log::warn;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::ENGINE_CORE_DEAD_SENTINEL;
@@ -201,10 +202,10 @@ async fn connect_link(
         match kv_capacity {
             Some(c) => {
                 // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
-                let blocks_per_req = u64::from(max_model_len).div_ceil(c.block_size as u64);
+                let blocks_per_req = u64::from(max_model_len).div_ceil(c.block_size.get() as u64);
                 (
                     c.total_blocks as u64,
-                    c.block_size as u64,
+                    c.block_size.get() as u64,
                     Some(c.total_tokens() as u64),
                     Some(c.total_blocks as f64 / blocks_per_req as f64),
                 )
@@ -233,7 +234,7 @@ async fn connect_link(
         max_loras: 0,
         kv_cache_size_tokens,
         kv_cache_max_concurrency,
-        effective_attention_block_size: kv_capacity.map(|c| c.block_size as u64),
+        effective_attention_block_size: kv_capacity.map(|c| c.block_size.get() as u64),
         kv_events_config: None,
         weight_transfer_backend: None,
         enable_sleep_mode: false,
@@ -309,15 +310,15 @@ async fn output_loop(
     Ok(())
 }
 
-fn send_terminal_output(
+/// Answer a request the bridge refuses before submitting it: an error finish
+/// carrying the reason, which the frontend reports to the client.
+fn send_refusal(
     engine_index: u32,
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     request_id: String,
-    finish_reason: EngineCoreFinishReason,
-    stop_reason: Option<StopReason>,
-    events: Option<Vec<EngineCoreEvent>>,
-    prefill_stats: Option<PrefillStats>,
+    reason: String,
 ) -> Result<()> {
+    warn!("request {request_id} refused: {reason}");
     send_outputs(
         output_tx,
         RequestBatchOutputs {
@@ -326,10 +327,10 @@ fn send_terminal_output(
                 request_id.clone(),
                 Vec::new(),
                 None,
-                Some(finish_reason),
-                stop_reason,
-                events,
-                prefill_stats,
+                Some(EngineCoreFinishReason::Error),
+                Some(StopReason::Text(reason)),
+                None,
+                None,
             )],
             finished_requests: Some(BTreeSet::from([request_id])),
             timestamp: now_secs_f64(),
@@ -339,6 +340,8 @@ fn send_terminal_output(
     )
 }
 
+/// Answers the utility calls whose truthful answer needs no engine support;
+/// every other call fails instead of reporting a success that did nothing.
 fn send_utility_response(
     engine_index: u32,
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
@@ -346,13 +349,12 @@ fn send_utility_response(
     method_name: &str,
 ) -> Result<()> {
     let result = match method_name {
-        "is_sleeping" | "is_paused" | "reset_prefix_cache" => rmpv::ext::to_value(false)?,
-        "sleep" | "wake_up" | "reset_mm_cache" | "reset_encoder_cache" | "collective_rpc" => {
-            rmpv::Value::Nil
+        "is_sleeping" | "is_scheduler_paused" | "reset_prefix_cache" => {
+            Ok(rmpv::Value::Boolean(false))
         }
-        _ => rmpv::Value::Nil,
+        "reset_mm_cache" | "reset_encoder_cache" => Ok(rmpv::Value::Nil),
+        unsupported => Err(format!("{unsupported} is not supported by this engine")),
     };
-
     send_outputs(
         output_tx,
         UtilityCallOutput {
@@ -360,8 +362,8 @@ fn send_utility_response(
             timestamp: now_secs_f64(),
             output: UtilityOutput {
                 call_id,
-                failure_message: None,
-                result: Some(UtilityResultEnvelope::without_type_info(result)),
+                failure_message: result.as_ref().err().cloned(),
+                result: result.ok().map(UtilityResultEnvelope::without_type_info),
             },
         }
         .into(),

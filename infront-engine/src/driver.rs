@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use super::ledger::RequestLedger;
 use super::metrics::SchedulerMetrics;
+use super::request_lifecycle::RequestEnvelope;
 use super::step::QueuedRequest;
 use super::wiring::LiveScheduler;
+use super::wiring::MetricsPublisher;
 use super::wiring::SchedulerBackend;
 use super::wiring::scheduler_pair;
 
@@ -67,13 +69,30 @@ pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> Live
 /// reports a fatal error. After an idle iteration (nothing running or
 /// waiting) the driver parks on the submission channel for up to
 /// [`IDLE_PARK`]; busy iterations never pause.
-pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
+pub fn drive<S: Scheduler>(scheduler: S, backend: SchedulerBackend) {
     let SchedulerBackend {
         submissions,
-        mut ledger,
+        ledger,
         metrics,
-        exit_guard: _exit_guard,
+        exit_guard,
     } = backend;
+    run(scheduler, submissions, ledger, &metrics);
+    // Everything that can still answer a request (the ledger's write-off, the
+    // envelopes left in the channel) has gone with `run`, returned or
+    // unwound, so `exited` resolves after the last of them was sent.
+    drop(exit_guard);
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "envelopes still queued are answered when the receiver drops, which must happen inside `run`"
+)]
+fn run<S: Scheduler>(
+    mut scheduler: S,
+    submissions: crossbeam_channel::Receiver<RequestEnvelope>,
+    mut ledger: RequestLedger,
+    metrics: &MetricsPublisher,
+) {
     let mut submissions_open = true;
     let mut idle = false;
     loop {
@@ -126,6 +145,7 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -354,6 +374,86 @@ mod tests {
             observed <= 2 * parks,
             "an idle driver must park between steps: {observed} steps in {window:?}"
         );
+    }
+
+    #[test]
+    fn exited_resolves_only_after_the_scheduler_is_gone() {
+        struct SlowToDrop(Arc<AtomicBool>);
+
+        impl Drop for SlowToDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(100));
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        impl Scheduler for SlowToDrop {
+            fn submit(&mut self, _request: QueuedRequest) {}
+
+            fn step(&mut self, _ledger: &mut RequestLedger) -> anyhow::Result<()> {
+                anyhow::bail!("injected fatal")
+            }
+
+            fn metrics(&self) -> SchedulerMetrics {
+                SchedulerMetrics::default()
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let partition = spawn_scheduler("test-exit-order", SlowToDrop(Arc::clone(&dropped)));
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(partition.handle.exited());
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "exited resolved while the scheduler could still answer requests"
+        );
+        partition.join.join().expect("driver exits after fatal");
+    }
+
+    #[test]
+    fn a_panicking_step_still_ships_what_it_answered() {
+        struct PanicsAfterFinishing;
+
+        impl Scheduler for PanicsAfterFinishing {
+            fn submit(&mut self, _request: QueuedRequest) {}
+
+            fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()> {
+                let (finished, open) = (RequestId::new(0), RequestId::new(1));
+                ledger.admit(finished);
+                ledger.admit(open);
+                ledger.push_tokens(finished, &[7], &[]);
+                ledger.finish(finished, FinishReason::Length);
+                panic!("injected panic");
+            }
+
+            fn metrics(&self) -> SchedulerMetrics {
+                SchedulerMetrics::default()
+            }
+        }
+
+        let (mut handle, backend) = scheduler_pair();
+        let mut steps = handle.take_steps().expect("step stream");
+        let _finished = handle.submit(request(1));
+        let _open = handle.submit(request(8));
+        let join = std::thread::spawn(move || drive(PanicsAfterFinishing, backend));
+        assert!(join.join().is_err(), "the step panics");
+
+        let step = steps.try_recv().expect("the teardown sweep");
+        let terminal = |id: u64| {
+            let update = step
+                .updates
+                .iter()
+                .find(|update| update.id == RequestId::new(id))
+                .expect("an update per request");
+            (update.tokens.clone(), update.terminal.as_ref())
+        };
+        assert!(matches!(
+            terminal(0),
+            (tokens, Some(Terminal::Finished { reason: FinishReason::Length, .. })) if tokens == [7]
+        ));
+        assert!(matches!(terminal(1), (_, Some(Terminal::Failed { .. }))));
     }
 
     #[test]

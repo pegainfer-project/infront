@@ -150,3 +150,36 @@ fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
     assert_eq!(none.prefix_cache_stats, PrefixCacheStats::default());
     assert_eq!(none.connector_prefix_cache_stats, None);
 }
+
+#[test]
+fn unsupported_utility_calls_fail_instead_of_faking_success() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut answer = |method: &str| {
+        send_utility_response(0, &tx, UtilityCallId::default(), method).unwrap();
+        let EngineCoreOutputs::Utility(call) = rx.try_recv().expect("an answer") else {
+            panic!("expected a utility answer");
+        };
+        call.output
+    };
+    for method in [
+        "sleep",
+        "wake_up",
+        "pause_generation",
+        "collective_rpc",
+        "add_lora",
+    ] {
+        let output = answer(method);
+        assert!(output.result.is_none(), "{method}");
+        assert!(
+            output
+                .failure_message
+                .is_some_and(|message| message.contains(method)),
+            "{method}"
+        );
+    }
+    for method in ["is_sleeping", "is_scheduler_paused", "reset_mm_cache"] {
+        let output = answer(method);
+        assert!(output.failure_message.is_none(), "{method}");
+        assert!(output.result.is_some(), "{method}");
+    }
+}
