@@ -5,6 +5,7 @@ use infront_engine::EosPolicy;
 use infront_engine::FinishReason;
 use infront_engine::PromptEcho;
 use infront_engine::SamplingParams;
+use infront_engine::StopCause;
 use infront_engine::StopPolicy;
 use infront_engine::TokenLogprob;
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
@@ -12,6 +13,7 @@ use vllm_engine_core_client::protocol::logprobs::MaybeWireLogprobs;
 use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
 use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogprob;
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
+use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
 /// A sampled position: the chosen token, then its top-k without repeating it.
@@ -84,24 +86,9 @@ pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<Maybe
 }
 
 pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
-    // The vLLM frontend lowers a client `ignore_eos=true` to `_eos_token_id:
-    // None`, but `_all_stop_token_ids` always carries the model EOS set (it
-    // exists for min_tokens masking, not stop detection). This conversion feeds
-    // the legacy SamplingParams contract, which has no field for explicit
-    // request stop IDs; keep its historical lowering until each producer is
-    // migrated to StopPolicy. Qwen3 receives the independent policy below.
-    let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
     if params.temperature <= 0.0 {
-        return SamplingParams {
-            temperature: 0.0,
-            top_k: -1,
-            top_p: 1.0,
-            min_p: 0.0,
-            seed: None,
-            ignore_eos,
-        };
+        return SamplingParams::default();
     }
-
     SamplingParams {
         temperature: params.temperature,
         top_k: if params.top_k == 0 {
@@ -112,7 +99,6 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
         top_p: params.top_p,
         min_p: params.min_p,
         seed: params.seed.map(|s| s as u64),
-        ignore_eos,
     }
 }
 
@@ -201,11 +187,15 @@ pub(crate) fn requested_prompt_logprobs(params: &EngineCoreSamplingParams) -> Op
     params.prompt_logprobs.map(|count| count as usize)
 }
 
-pub(crate) fn convert_finish_reason(reason: FinishReason) -> EngineCoreFinishReason {
+/// vLLM reports no stop reason for the primary EOS and the token id for any
+/// other stop token.
+pub(crate) fn wire_finish(reason: FinishReason) -> (EngineCoreFinishReason, Option<StopReason>) {
     match reason {
-        FinishReason::Length => EngineCoreFinishReason::Length,
-        FinishReason::Stop => EngineCoreFinishReason::Stop,
-        FinishReason::Error => EngineCoreFinishReason::Error,
+        FinishReason::Length => (EngineCoreFinishReason::Length, None),
+        FinishReason::Stop(StopCause::Eos(_)) => (EngineCoreFinishReason::Stop, None),
+        FinishReason::Stop(StopCause::Token(id)) => {
+            (EngineCoreFinishReason::Stop, Some(StopReason::TokenId(id)))
+        }
     }
 }
 
@@ -227,26 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_sampling_honors_ignore_eos_lowering() {
-        // ignore_eos=true lowering: _eos_token_id=None while
-        // _all_stop_token_ids still carries the model EOS set.
-        let mut params = EngineCoreSamplingParams::for_test();
-        params.all_stop_token_ids = BTreeSet::from([163_586]);
-        assert!(convert_sampling(&params).ignore_eos);
-
-        // Normal request: _eos_token_id present.
-        params.eos_token_id = Some(163_586);
-        assert!(!convert_sampling(&params).ignore_eos);
-
-        // The legacy SamplingParams contract keeps EOS active when explicit
-        // stop IDs are present; the stepped Qwen3 path carries those IDs in
-        // StopPolicy instead.
-        params.eos_token_id = None;
-        params.stop_token_ids = vec![42];
-        assert!(!convert_sampling(&params).ignore_eos);
-    }
-
-    #[test]
     fn convert_stop_policy_keeps_primary_and_secondary_eos_distinct() {
         let mut params = EngineCoreSamplingParams::for_test();
         params.eos_token_id = Some(99);
@@ -255,25 +225,16 @@ mod tests {
         let policy = convert_stop_policy(&params);
         // The primary protocol EOS is carried as `EosPolicy::Token`, so it is
         // still an EOS stop even when the model predicate is unavailable.
-        assert_eq!(
-            policy.classify(99, |_| false),
-            Some(infront_engine::StopCause::Eos(99))
-        );
+        assert_eq!(policy.classify(99, |_| false), Some(StopCause::Eos(99)));
         // Secondary model EOS IDs must keep their token stop reason.
-        assert_eq!(
-            policy.classify(100, |_| true),
-            Some(infront_engine::StopCause::Token(100))
-        );
+        assert_eq!(policy.classify(100, |_| true), Some(StopCause::Token(100)));
 
         params.eos_token_id = None;
         params.stop_token_ids = vec![99];
         params.all_stop_token_ids = BTreeSet::from([99, 100]);
         let policy = convert_stop_policy(&params);
         // EOS disabled: the primary ID stops only when explicitly requested.
-        assert_eq!(
-            policy.classify(99, |_| true),
-            Some(infront_engine::StopCause::Token(99))
-        );
+        assert_eq!(policy.classify(99, |_| true), Some(StopCause::Token(99)));
         assert_eq!(policy.classify(100, |_| true), None);
     }
 

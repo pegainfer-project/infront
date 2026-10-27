@@ -220,7 +220,6 @@ mod tests {
             terminal,
             Some(Terminal::Finished {
                 reason: FinishReason::Length,
-                stop_cause: None,
                 prompt_tokens: 2,
                 completion_tokens: 3,
             })

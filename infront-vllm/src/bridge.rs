@@ -42,10 +42,6 @@ use zeromq::prelude::Socket;
 use zeromq::prelude::SocketSend;
 use zeromq::util::PeerIdentity;
 
-fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option<u32> {
-    eos_token_id.or_else(|| stop_token_ids.first().copied())
-}
-
 /// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.

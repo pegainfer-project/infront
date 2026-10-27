@@ -12,7 +12,6 @@ pub struct SamplingParams {
     /// the same tokens for the same request where the engine's draw depends
     /// on nothing else, or at the same batch layout where it does.
     pub seed: Option<u64>,
-    pub ignore_eos: bool,
 }
 
 impl Default for SamplingParams {
@@ -23,7 +22,6 @@ impl Default for SamplingParams {
             top_p: 1.0,
             min_p: 0.0,
             seed: None,
-            ignore_eos: false,
         }
     }
 }

@@ -14,7 +14,6 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use infront_engine::FinishReason;
 use infront_engine::KvCapacity;
 use infront_engine::Request;
 use infront_engine::RequestControl;
@@ -22,7 +21,6 @@ use infront_engine::RequestId;
 use infront_engine::RequestUpdate;
 use infront_engine::SchedulerHandle;
 use infront_engine::StepOutputs;
-use infront_engine::StopCause;
 use infront_engine::Terminal;
 use log::debug;
 use log::info;
@@ -53,15 +51,14 @@ use super::now_secs_f64;
 use super::send_outputs;
 use super::send_terminal_output;
 use super::send_utility_response;
-use super::stop_sentinel_id;
 use crate::history::GENERATION_PROMPT_TOKENS;
-use crate::wire::convert_finish_reason;
 use crate::wire::convert_sampling;
 use crate::wire::convert_stop_policy;
 use crate::wire::requested_logprobs;
 use crate::wire::requested_prompt_logprobs;
 use crate::wire::to_wire_position_logprobs;
 use crate::wire::to_wire_prompt_logprobs;
+use crate::wire::wire_finish;
 
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -377,20 +374,8 @@ impl SteppedEngineBridge {
         let history_tokens = extra_arg(GENERATION_PROMPT_TOKENS)
             .and_then(serde_json::Value::as_u64)
             .and_then(|tail| prompt_tokens.len().checked_sub(tail as usize));
-        // Older stepped model producers still suppress their terminal token
-        // and report only `FinishReason::Stop`. Keep the legacy sentinel for
-        // that producer shape; typed stop causes carry the real token and do
-        // not need a synthetic suffix.
-        let stop_sentinel_id = stop_sentinel_id(
-            sampling_params.eos_token_id,
-            &sampling_params.stop_token_ids,
-        );
-
         let control = self.scheduler.submit(Request {
             prompt_tokens,
-            // Keep the legacy SamplingParams lowering unchanged for stepped
-            // producers that have not migrated to StopPolicy. Qwen3 uses the
-            // independent policy below for stop classification.
             params: convert_sampling(&sampling_params),
             history_tokens,
             stop_policy: convert_stop_policy(&sampling_params),
@@ -401,10 +386,7 @@ impl SteppedEngineBridge {
 
         debug!("request {request_id} submitted as {}", control.id());
         names.insert(request_id.clone(), control.id());
-        streams.insert(
-            control.id(),
-            SteppedStream::new(request_id, control, stop_sentinel_id),
-        );
+        streams.insert(control.id(), SteppedStream::new(request_id, control));
         Ok(())
     }
 }
@@ -422,14 +404,10 @@ struct SteppedStream {
     prompt_tokens: Option<usize>,
     cached_tokens: usize,
     prefill_stats_sent: bool,
-    /// Compatibility sentinel for stepped producers that predate typed
-    /// [`StopCause`]. New producers must include their triggering token in the
-    /// update and therefore bypass this fallback.
-    stop_sentinel_id: Option<u32>,
 }
 
 impl SteppedStream {
-    fn new(request_id: String, control: RequestControl, stop_sentinel_id: Option<u32>) -> Self {
+    fn new(request_id: String, control: RequestControl) -> Self {
         Self {
             request_id,
             control,
@@ -437,7 +415,6 @@ impl SteppedStream {
             prompt_tokens: None,
             cached_tokens: 0,
             prefill_stats_sent: false,
-            stop_sentinel_id,
         }
     }
 
@@ -508,67 +485,51 @@ fn reduce_update(
         Err(error) => return state.fail_prompt(&error),
     };
 
-    let mut token_ids = update.tokens;
-    let mut has_logprobs = false;
-    let mut positions: Vec<PositionLogprobs> = Vec::with_capacity(token_ids.len());
-    for (i, &id) in token_ids.iter().enumerate() {
-        let logprob = update.logprobs.get(i).cloned().flatten();
-        if let Some(position) = to_wire_position_logprobs(id, logprob) {
-            has_logprobs = true;
-            positions.push(position);
-        } else {
-            positions.push(PositionLogprobs {
-                entries: Vec::new(),
-            });
-        }
-    }
+    let token_ids = update.tokens;
+    let logprobs = update.logprobs.iter().any(Option::is_some).then(|| {
+        MaybeWireLogprobs::Direct(Logprobs {
+            positions: token_ids
+                .iter()
+                .zip(update.logprobs)
+                .map(|(&id, logprob)| {
+                    to_wire_position_logprobs(id, logprob).unwrap_or(PositionLogprobs {
+                        entries: Vec::new(),
+                    })
+                })
+                .collect(),
+        })
+    });
 
-    let mut finish_reason: Option<EngineCoreFinishReason> = None;
-    let mut stop_reason: Option<StopReason> = None;
-    let mut terminated = false;
-    match update.terminal {
-        None => {}
-        Some(Terminal::Finished {
-            reason, stop_cause, ..
-        }) => {
-            if reason == FinishReason::Stop
-                && stop_cause.is_none()
-                && let Some(stop_sentinel_id) = state.stop_sentinel_id
-            {
-                token_ids.push(stop_sentinel_id);
-                positions.push(PositionLogprobs {
-                    entries: Vec::new(),
-                });
-            }
-            if let Some(StopCause::Token(token_id)) = stop_cause {
-                stop_reason = Some(StopReason::TokenId(token_id));
-            }
-
-            finish_reason = Some(convert_finish_reason(reason));
-            terminated = true;
+    let (finish_reason, stop_reason) = match update.terminal {
+        None => (None, None),
+        Some(Terminal::Finished { reason, .. }) => {
+            let (finish, stop) = wire_finish(reason);
+            (Some(finish), stop)
         }
         Some(Terminal::Rejected { reason, .. }) => {
             // The vLLM wire only carries a string; typed classification stops
             // here and the rendered message is what reaches the client.
             let message = reason.to_string();
             warn!("request {} rejected: {message}", state.request_id);
-            finish_reason = Some(EngineCoreFinishReason::Error);
-            stop_reason = Some(StopReason::Text(message));
-            terminated = true;
+            (
+                Some(EngineCoreFinishReason::Error),
+                Some(StopReason::Text(message)),
+            )
         }
         Some(Terminal::Failed { message, .. }) => {
             warn!("request {} failed: {message}", state.request_id);
-            finish_reason = Some(EngineCoreFinishReason::Error);
-            stop_reason = Some(StopReason::Text(message));
-            terminated = true;
+            (
+                Some(EngineCoreFinishReason::Error),
+                Some(StopReason::Text(message)),
+            )
         }
-    }
+    };
+    let terminated = finish_reason.is_some();
 
     if token_ids.is_empty() && prompt_logprobs.is_none() && !terminated {
         return (None, false);
     }
 
-    let logprobs = has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions }));
     let mut output = engine_output(
         state.request_id.clone(),
         token_ids,
@@ -612,9 +573,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    use infront_engine::FinishReason;
     use infront_engine::PromptEcho;
     use infront_engine::RejectReason;
     use infront_engine::ScheduledInfo;
+    use infront_engine::StopCause;
     use infront_engine::StopPolicy;
     use infront_engine::TokenLogprob;
     use infront_engine::scheduler_pair;
@@ -639,7 +602,7 @@ mod tests {
     fn unsupported_rejection_is_rendered_for_vllm() {
         let (handle, _backend) = scheduler_pair();
         let control = handle.submit(request());
-        let mut stream = SteppedStream::new("unsupported".into(), control, None);
+        let mut stream = SteppedStream::new("unsupported".into(), control);
         let mut update = infront_engine::testing::empty_update(stream.control.id());
         update.terminal = Some(Terminal::Rejected {
             reason: RejectReason::Unsupported {
@@ -689,7 +652,7 @@ mod tests {
         });
         let mut streams = HashMap::from([(
             control.id(),
-            SteppedStream::new("scheduled".into(), control, None),
+            SteppedStream::new("scheduled".into(), control),
         )]);
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -815,7 +778,7 @@ mod tests {
         let id = RequestId::new(7);
         let control =
             infront_engine::testing::request_control(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-7".to_string(), control, None);
+        let mut state = SteppedStream::new("request-7".to_string(), control);
 
         let mut update = infront_engine::testing::empty_update(id);
         update.tokens = vec![11, 43];
@@ -828,8 +791,7 @@ mod tests {
             }),
         ];
         update.terminal = Some(Terminal::Finished {
-            reason: FinishReason::Stop,
-            stop_cause: Some(StopCause::Token(43)),
+            reason: FinishReason::Stop(StopCause::Token(43)),
             prompt_tokens: 16,
             completion_tokens: 2,
         });
@@ -857,14 +819,13 @@ mod tests {
         let id = RequestId::new(8);
         let control =
             infront_engine::testing::request_control(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-8".to_string(), control, None);
+        let mut state = SteppedStream::new("request-8".to_string(), control);
 
         let mut update = infront_engine::testing::empty_update(id);
         update.tokens = vec![2];
         update.logprobs = vec![None];
         update.terminal = Some(Terminal::Finished {
-            reason: FinishReason::Stop,
-            stop_cause: Some(StopCause::Eos(2)),
+            reason: FinishReason::Stop(StopCause::Eos(2)),
             prompt_tokens: 16,
             completion_tokens: 1,
         });
@@ -875,30 +836,6 @@ mod tests {
         assert!(terminated);
         assert_eq!(output.new_token_ids, vec![2]);
         assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
-        assert_eq!(output.stop_reason, None);
-    }
-
-    #[test]
-    fn legacy_stop_without_typed_cause_keeps_the_wire_sentinel() {
-        let id = RequestId::new(9);
-        let control =
-            infront_engine::testing::request_control(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-9".to_string(), control, Some(99));
-
-        let mut update = infront_engine::testing::empty_update(id);
-        update.tokens = vec![11];
-        update.terminal = Some(Terminal::Finished {
-            reason: FinishReason::Stop,
-            stop_cause: None,
-            prompt_tokens: 16,
-            completion_tokens: 1,
-        });
-
-        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
-        let output = output.expect("terminal output");
-
-        assert!(terminated);
-        assert_eq!(output.new_token_ids, vec![11, 99]);
         assert_eq!(output.stop_reason, None);
     }
 }

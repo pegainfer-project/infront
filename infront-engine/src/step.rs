@@ -23,11 +23,15 @@ pub struct TokenLogprob {
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
+/// How a request ended normally. An engine-side error is not a finish: it
+/// is [`super::RequestLedger::fail`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinishReason {
+    /// Reached `max_tokens`.
     Length,
-    Stop,
-    Error,
+    /// Emitted a token its [`super::StopPolicy`] stops on. The token is the
+    /// last one pushed for the request, with its logprob when requested.
+    Stop(StopCause),
 }
 
 /// In-process routing id for one generate request, minted by
@@ -244,9 +248,6 @@ impl fmt::Display for RejectReason {
 pub enum Terminal {
     Finished {
         reason: FinishReason,
-        /// Present for token-driven stop finishes. The triggering token remains
-        /// in `RequestUpdate.tokens`, with its matching logprob when requested.
-        stop_cause: Option<StopCause>,
         prompt_tokens: usize,
         completion_tokens: usize,
     },
