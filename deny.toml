@@ -1,10 +1,10 @@
 [advisories]
 ignore = [
-  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled in by tokenizers via vLLM" },
-  { id = "RUSTSEC-2026-0249", reason = "smartstring is unmaintained; pulled in by serde-json-fmt via vLLM" },
-  { id = "RUSTSEC-2026-0391", reason = "fixed only in zstd 0.14; oss-harmony via vLLM pins 0.13" },
-  { id = "RUSTSEC-2026-0398", reason = "fixed only in zstd-safe 8.2; oss-harmony via vLLM pins zstd 0.13" },
-  { id = "RUSTSEC-2026-0403", reason = "fixed only in zstd-safe 8.2; oss-harmony via vLLM pins zstd 0.13" },
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained, no vulnerability; paste is a proc macro, compile time only" },
+  { id = "RUSTSEC-2026-0249", reason = "unmaintained, no vulnerability; smartstring backs serde-json-fmt in vllm-chat" },
+  { id = "RUSTSEC-2026-0391", reason = "unreachable: affects Encoder/Decoder::with_context; zstd's only caller, oss-harmony, uses decode_all" },
+  { id = "RUSTSEC-2026-0398", reason = "unreachable: affects Seekable, and the seekable feature is off" },
+  { id = "RUSTSEC-2026-0403", reason = "unreachable: affects write::Decoder; oss-harmony uses decode_all on embedded vocab data" },
 ]
 yanked = "deny"
 
