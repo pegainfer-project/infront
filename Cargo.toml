@@ -1,5 +1,5 @@
 [workspace]
-members = ["infront-engine", "infront-vllm"]
+members = ["infront-engine", "infront-vllm", "xtask"]
 resolver = "3"
 
 [workspace.package]

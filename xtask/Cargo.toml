@@ -1,0 +1,12 @@
+[package]
+description = "Repository workflows behind `cargo x`."
+edition.workspace = true
+license.workspace = true
+name = "x"
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+
+[lints]
+workspace = true
