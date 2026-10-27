@@ -36,7 +36,6 @@ use super::step::ScheduledInfo;
 use super::step::StepOutputs;
 use super::step::Terminal;
 use super::step::TokenLogprob;
-use super::stop::StopCause;
 
 /// One open account: the request's admission facts and running tally. The
 /// payload is not here — it went to the scheduler at `submit`; the account is
@@ -232,23 +231,12 @@ impl RequestLedger {
 
     /// Finish the request. Token counts come from the ledger's tally.
     pub fn finish(&mut self, id: RequestId, reason: FinishReason) {
-        self.finish_with_cause(id, reason, None);
-    }
-
-    /// Finish a request while preserving a typed token-level stop cause.
-    pub fn finish_with_cause(
-        &mut self,
-        id: RequestId,
-        reason: FinishReason,
-        stop_cause: Option<StopCause>,
-    ) {
         let account = self.close(id);
         let AccountState::Active { completion_tokens } = account.state else {
             panic!("finish on {id} before admission");
         };
         self.statement.entry(id).terminal = Some(Terminal::Finished {
             reason,
-            stop_cause,
             prompt_tokens: account.prompt_len,
             completion_tokens,
         });
@@ -354,6 +342,7 @@ mod tests {
     use super::super::request_lifecycle::StepReceiver;
     use super::super::step::Request;
     use super::super::step::Terminal;
+    use super::super::stop::StopCause;
     use super::super::stop::StopPolicy;
     use super::super::wiring::SchedulerHandle;
     use super::super::wiring::scheduler_pair;
@@ -383,7 +372,7 @@ mod tests {
         backend.ledger.set_cached_tokens(id, 2);
         backend
             .ledger
-            .finish_with_cause(id, FinishReason::Stop, Some(StopCause::Token(11)));
+            .finish(id, FinishReason::Stop(StopCause::Token(11)));
         backend.ledger.commit_step(false);
 
         let mut steps = handle_steps(handle);
@@ -399,8 +388,7 @@ mod tests {
         assert!(matches!(
             update.terminal,
             Some(Terminal::Finished {
-                reason: FinishReason::Stop,
-                stop_cause: Some(StopCause::Token(11)),
+                reason: FinishReason::Stop(StopCause::Token(11)),
                 prompt_tokens: 3,
                 completion_tokens: 2,
             })
@@ -519,7 +507,7 @@ mod tests {
         let envelope = backend.submissions.try_recv().expect("envelope");
         let id = backend.ledger.register(envelope).id;
         backend.ledger.admit(id);
-        backend.ledger.finish(id, FinishReason::Stop);
+        backend.ledger.finish(id, FinishReason::Length);
         backend.ledger.push_tokens(id, &[1], &[]);
     }
 

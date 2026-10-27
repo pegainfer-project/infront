@@ -30,6 +30,11 @@ pub struct StopPolicy {
 }
 
 impl StopPolicy {
+    #[must_use]
+    pub fn eos(&self) -> EosPolicy {
+        self.eos
+    }
+
     /// Build a policy from wire-provided stop IDs.
     ///
     /// Normalization happens once at the request boundary. Internal copies can

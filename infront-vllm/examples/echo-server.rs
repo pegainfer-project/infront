@@ -19,12 +19,14 @@ use std::path::PathBuf;
 use clap::Parser;
 use infront_engine::Engine;
 use infront_engine::EngineInfo;
+use infront_engine::EosPolicy;
 use infront_engine::FinishReason;
 use infront_engine::QueuedRequest;
 use infront_engine::RequestId;
 use infront_engine::RequestLedger;
 use infront_engine::Scheduler;
 use infront_engine::SchedulerMetrics;
+use infront_engine::StopPolicy;
 use infront_engine::spawn_scheduler;
 
 /// A `config.json` plus a byte-level tokenizer: what the frontend needs to
@@ -42,26 +44,25 @@ struct Args {
     served_model_name: String,
 }
 
-/// Answers each request with its own prompt tokens: echo
-/// `prompt[..min(len, max_tokens)]` back, one token per step, then finish —
-/// `FinishReason::Stop` for a full echo, `FinishReason::Length` when
-/// `max_tokens` cut it short. One token per step keeps the per-token
-/// streaming path warm instead of collapsing the response into one batch.
+/// Answers each request with its own prompt tokens, one per step, then the
+/// request's EOS: a model whose output is its input. Every token goes through
+/// the request's [`StopPolicy`] as a real model's would, so a stop token in
+/// the prompt ends the echo there; `max_tokens` cuts it short with
+/// `FinishReason::Length`, as does running out of script with EOS ignored.
+/// One token per step keeps the per-token streaming path warm instead of
+/// collapsing the response into one batch.
 #[derive(Default)]
 struct EchoScheduler {
     queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
 }
 
-/// One admission onward: the request's ledger id plus its echo cursor —
-/// prompt tokens not yet echoed and whether `max_tokens` trimmed the echo
-/// short.
 struct RunningRequest {
     id: RequestId,
-    /// Prompt tokens not yet echoed, stored reversed for cheap pops.
-    pending: Vec<u32>,
-    /// Whether `max_tokens` trimmed the prompt (decides the finish reason).
-    truncated: bool,
+    /// Tokens still to emit, reversed for cheap pops.
+    script: Vec<u32>,
+    stop_policy: StopPolicy,
+    max_tokens: usize,
 }
 
 impl Scheduler for EchoScheduler {
@@ -75,33 +76,36 @@ impl Scheduler for EchoScheduler {
                 ledger.retire(id);
                 continue;
             }
-            let echo_len = request.prompt_tokens.len().min(request.max_tokens);
-            let truncated = echo_len < request.prompt_tokens.len();
-            let mut pending = Vec::from(&request.prompt_tokens[..echo_len]);
-            pending.reverse();
+            let eos = match request.stop_policy.eos() {
+                EosPolicy::Token(eos) => Some(eos),
+                EosPolicy::Ignore | EosPolicy::ModelDefault => None,
+            };
             ledger.admit(id);
             self.running.push(RunningRequest {
                 id,
-                pending,
-                truncated,
+                script: request.prompt_tokens.into_iter().chain(eos).rev().collect(),
+                stop_policy: request.stop_policy,
+                max_tokens: request.max_tokens,
             });
         }
         let mut still_running = Vec::new();
         for mut running in self.running.drain(..) {
-            if ledger.is_aborted(running.id) {
-                ledger.retire(running.id);
+            let id = running.id;
+            if ledger.is_aborted(id) {
+                ledger.retire(id);
                 continue;
             }
-            if let Some(token) = running.pending.pop() {
-                ledger.push_tokens(running.id, &[token], &[]);
-                still_running.push(running);
+            let Some(token) = running.script.pop() else {
+                ledger.finish(id, FinishReason::Length);
+                continue;
+            };
+            ledger.push_tokens(id, &[token], &[]);
+            if let Some(cause) = running.stop_policy.classify(token, |_| false) {
+                ledger.finish(id, FinishReason::Stop(cause));
+            } else if ledger.completion_tokens(id) >= running.max_tokens {
+                ledger.finish(id, FinishReason::Length);
             } else {
-                let reason = if running.truncated {
-                    FinishReason::Length
-                } else {
-                    FinishReason::Stop
-                };
-                ledger.finish(running.id, reason);
+                still_running.push(running);
             }
         }
         self.running = still_running;
