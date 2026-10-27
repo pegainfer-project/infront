@@ -1,0 +1,38 @@
+[package]
+description = "Serve an infront-engine scheduler behind vLLM's Rust OpenAI-compatible frontend."
+edition.workspace = true
+license.workspace = true
+name = "infront-vllm"
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+fastrace = { workspace = true }
+http-body-util = { workspace = true }
+infront-engine = { workspace = true }
+log = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+uuid = { workspace = true }
+vllm-chat = { workspace = true }
+vllm-engine-core-client = { workspace = true }
+vllm-server = { workspace = true }
+vllm-text = { workspace = true }
+zeromq = { workspace = true }
+
+[dev-dependencies]
+clap = { workspace = true }
+futures = { workspace = true }
+infront-engine = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

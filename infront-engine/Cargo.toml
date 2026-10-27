@@ -1,0 +1,25 @@
+[package]
+description = "The scheduler contract behind infront: what an inference engine implements to be served."
+edition.workspace = true
+license.workspace = true
+name = "infront-engine"
+repository.workspace = true
+version.workspace = true
+
+[features]
+# Driver-side hooks for protocol-stack tests.
+testing = []
+
+[dependencies]
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+fastrace = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[lints]
+workspace = true
