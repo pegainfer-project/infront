@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use anyhow::ensure;
-use axum::Router;
 use infront_engine::Engine;
 use log::warn;
 use serde::Deserialize;
@@ -31,11 +29,13 @@ use vllm_text::backend::hf::HfOverrides;
 
 mod bridge;
 mod history;
+mod shaping;
 mod wire;
 
 use bridge::SteppedEngineBridge;
 use bridge::ipc_endpoint;
 use bridge::local_ipc_namespace;
+pub use shaping::Capabilities;
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {
@@ -50,142 +50,71 @@ impl ModelLenConfig {
     }
 }
 
-/// Serve while the engine is still loading: the HTTP frontend (tokenizer,
-/// chat templates) starts immediately and the engine bridge attaches once
-/// `engine` resolves. HTTP binds only after the bridge registers, so a
-/// reachable port still means the engine is ready.
-///
-/// Pass `max_model_len: None` to read `max_position_embeddings` from
-/// `model_path/config.json`; pass `Some(n)` when the path has no config
-/// (e.g. a HuggingFace model id for the sim frontend).
-/// `tool_call_parser` selects the output tool-call parser (see the
-/// `--tool-call-parser` CLI flag for the `Auto` matching caveat).
+/// How [`serve`] exposes an engine. [`ServeOptions::new`] fills in the
+/// defaults: one scheduler, every capability served, no history boundary,
+/// all interfaces on port 8000.
+#[derive(Clone, Debug)]
+pub struct ServeOptions {
+    /// A local checkpoint directory (config.json, tokenizer, chat template)
+    /// or a Hugging Face model id.
+    pub model: String,
+    /// Names the endpoint answers to; empty serves under `model`.
+    pub served_model_names: Vec<String>,
+    pub tool_call_parser: ParserSelection,
+    pub host: String,
+    pub port: u16,
+    /// Longest request in tokens; `None` reads `max_position_embeddings`
+    /// from `model`'s config.json. The engine's `servable_len` caps either.
+    pub max_model_len: Option<u32>,
+    /// Schedulers the engine exposes. The frontend sizes its routing before
+    /// the engine resolves, so the count is declared here and checked against
+    /// [`Engine::schedulers`].
+    pub engine_count: NonZeroUsize,
+    pub capabilities: Capabilities,
+    /// Measure each chat prompt's history boundary into
+    /// [`infront_engine::Request::history_tokens`], at one render and
+    /// tokenization of the last message per chat request.
+    pub history_boundary: bool,
+}
+
+impl ServeOptions {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            served_model_names: Vec::new(),
+            tool_call_parser: ParserSelection::Auto,
+            host: "0.0.0.0".to_string(),
+            port: 8000,
+            max_model_len: None,
+            engine_count: NonZeroUsize::MIN,
+            capabilities: Capabilities::default(),
+            history_boundary: false,
+        }
+    }
+}
+
+/// Serve `engine` behind vLLM's OpenAI-compatible frontend until `shutdown`.
+/// The HTTP frontend (tokenizer, chat templates) starts loading immediately
+/// and the engine bridge attaches once `engine` resolves; HTTP binds only
+/// after the bridge registers, so a reachable port means the engine is ready.
 pub async fn serve(
     engine: impl Future<Output = Result<Engine>> + Send + 'static,
-    model_path: &Path,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    port: u16,
-    max_model_len: Option<u32>,
+    options: ServeOptions,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    serve_with_engine_count(
-        engine,
-        model_path,
-        served_model_name,
-        tool_call_parser,
-        port,
-        max_model_len,
-        1,
-        shutdown,
-    )
-    .await
-}
-
-/// Serve one HTTP endpoint backed by `engine_count` frontend-visible engine
-/// identities. Data-parallel model lines use one identity per scheduler
-/// partition; ordinary model lines call [`serve`] and get the single-engine
-/// case.
-pub async fn serve_with_engine_count(
-    engine: impl Future<Output = Result<Engine>> + Send + 'static,
-    model_path: &Path,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    port: u16,
-    max_model_len: Option<u32>,
-    engine_count: usize,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    serve_model_on_host(
-        engine,
-        model_path.to_string_lossy().into_owned(),
-        served_model_name,
-        tool_call_parser,
-        "0.0.0.0".to_string(),
-        port,
-        resolve_max_model_len(model_path, max_model_len),
-        engine_count,
-        shutdown,
-    )
-    .await
-}
-
-/// Serve as [`serve_with_engine_count`] does, behind the caller's routes:
-/// `extend_router` takes the vLLM router and returns the one that listens.
-/// An engine refuses what it does not serve here, with a 400 before the
-/// request reaches it.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve_with_router_extension<F>(
-    engine: impl Future<Output = Result<Engine>> + Send + 'static,
-    model_path: &Path,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    port: u16,
-    max_model_len: Option<u32>,
-    engine_count: usize,
-    shutdown: CancellationToken,
-    extend_router: F,
-) -> Result<()>
-where
-    F: FnOnce(Router) -> Router,
-{
-    serve_model_on_host_with_router_extension(
-        engine,
-        model_path.to_string_lossy().into_owned(),
-        served_model_name,
-        tool_call_parser,
-        "0.0.0.0".to_string(),
-        port,
-        resolve_max_model_len(model_path, max_model_len),
-        engine_count,
-        shutdown,
-        extend_router,
-    )
-    .await
-}
-
-async fn serve_model_on_host(
-    engine: impl Future<Output = Result<Engine>> + Send + 'static,
-    model_id: String,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    host: String,
-    port: u16,
-    max_model_len: u32,
-    engine_count: usize,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    serve_model_on_host_with_router_extension(
-        engine,
-        model_id,
-        served_model_name,
+    let ServeOptions {
+        model: model_id,
+        served_model_names,
         tool_call_parser,
         host,
         port,
         max_model_len,
         engine_count,
-        shutdown,
-        |router| router,
-    )
-    .await
-}
-
-async fn serve_model_on_host_with_router_extension<F>(
-    engine: impl Future<Output = Result<Engine>> + Send + 'static,
-    model_id: String,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    host: String,
-    port: u16,
-    max_model_len: u32,
-    engine_count: usize,
-    shutdown: CancellationToken,
-    extend_router: F,
-) -> Result<()>
-where
-    F: FnOnce(Router) -> Router,
-{
-    ensure!(engine_count > 0, "frontend engine_count must be positive");
+        capabilities,
+        history_boundary,
+    } = options;
+    let max_model_len = resolve_max_model_len(Path::new(&model_id), max_model_len);
+    let engine_count = engine_count.get();
     let data_parallel_size = u32::try_from(engine_count)
         .map_err(|_| anyhow::anyhow!("frontend engine_count {engine_count} exceeds u32"))?;
     let namespace = local_ipc_namespace()?;
@@ -299,25 +228,28 @@ where
         }
     });
 
-    // The history layer reads the served checkpoint's template and tokenizer,
-    // loaded once here; the server loads its own afterwards and reports its
-    // own error if the model is genuinely broken.
-    let backends = match load_model_backends(
-        &model_id,
-        LoadModelBackendsOptions {
-            language_model_only: true,
-            ..Default::default()
-        },
-    )
-    .await
-    {
-        Ok(backends) => Some(backends),
-        Err(error) => {
-            warn!("chat request shaping disabled: backends for {model_id} did not load: {error}");
-            None
+    // The history measure reads the served checkpoint's template and
+    // tokenizer, loaded once here; the server loads its own afterwards and
+    // reports its own error if the model is genuinely broken.
+    let boundary = if history_boundary {
+        match load_model_backends(
+            &model_id,
+            LoadModelBackendsOptions {
+                language_model_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(backends) => Some(history::Boundary::new(&backends)),
+            Err(error) => {
+                warn!("history boundary disabled: backends for {model_id} did not load: {error}");
+                None
+            }
         }
+    } else {
+        None
     };
-    let boundary = backends.map(|b| Arc::new(history::Boundary::new(&b)));
 
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
@@ -337,7 +269,7 @@ where
         revision: None,
         hf_overrides: HfOverrides::default(),
         generation_config: GenerationConfigMode::Auto,
-        served_model_name,
+        served_model_name: served_model_names,
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser,
         reasoning_parser: ParserSelection::default(),
@@ -374,7 +306,7 @@ where
     };
 
     let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
-        history::mark_history(extend_router(router), boundary)
+        shaping::shape(router, capabilities, boundary)
     })
     .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
@@ -397,7 +329,7 @@ where
     result
 }
 
-pub fn load_max_model_len(model_path: &Path) -> Option<u32> {
+fn load_max_model_len(model_path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(model_path.join("config.json")).ok()?;
     serde_json::from_str::<ModelLenConfig>(&content)
         .ok()?

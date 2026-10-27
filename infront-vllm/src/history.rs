@@ -29,26 +29,6 @@
 //! rejects) passes through untouched and the scheduler sees no boundary; the
 //! route reports its own error for it.
 
-use std::sync::Arc;
-
-use axum::Error as AxumError;
-use axum::Json;
-use axum::Router;
-use axum::body::Body;
-use axum::body::Bytes;
-use axum::body::to_bytes;
-use axum::extract::Request;
-use axum::extract::State;
-use axum::http::HeaderValue;
-use axum::http::Method;
-use axum::http::StatusCode;
-use axum::http::header::CONTENT_LENGTH;
-use axum::middleware;
-use axum::middleware::Next;
-use axum::response::IntoResponse;
-use axum::response::Response;
-use http_body_util::LengthLimitError;
-use log::debug;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
@@ -64,13 +44,6 @@ use vllm_chat::SamplingParams;
 use vllm_text::Prompt;
 use vllm_text::TextDecodeOptions;
 use vllm_text::tokenizer::DynTokenizer;
-
-/// The only route whose prompt has a generation prompt to measure.
-const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
-
-/// The body is buffered to be rewritten, and an oversized request must not be
-/// silently truncated.
-const BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// The `vllm_xargs` key carrying the generation prompt's token count from
 /// this layer to the bridge.
@@ -201,89 +174,25 @@ fn probe_request(message: ChatMessage, chat_options: ChatOptions) -> ChatRequest
     }
 }
 
-/// Wrap a router so every chat request carries its generation prompt's token
-/// count into `vllm_xargs`; a server whose backends did not load serves the
-/// router as is.
-pub(crate) fn mark_history(router: Router, boundary: Option<Arc<Boundary>>) -> Router {
-    match boundary {
-        Some(boundary) => router.layer(middleware::from_fn_with_state(boundary, mark_request)),
-        None => router,
-    }
-}
-
-async fn mark_request(
-    State(boundary): State<Arc<Boundary>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if request.method() != Method::POST || request.uri().path() != CHAT_COMPLETIONS_PATH {
-        return next.run(request).await;
-    }
-
-    let (mut parts, body) = request.into_parts();
-    let mut bytes = match to_bytes(body, BODY_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(error) => return body_read_error(error),
-    };
-
-    if let Some(tokens) = mark_generation_prompt(&mut bytes, &boundary) {
-        debug!("generation prompt is {tokens} tokens");
-        parts
-            .headers
-            .insert(CONTENT_LENGTH, HeaderValue::from(bytes.len() as u64));
-    }
-
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
-}
-
-/// The route's error contract: the same OpenAI-style JSON envelope the
-/// upstream routes answer with (`vllm_server`'s `ApiError::to_error_response`,
-/// which is not exported). 413 belongs to the length-limit rejection alone;
-/// any other read failure is a 400.
-fn body_read_error(error: AxumError) -> Response {
-    let message = format!("failed to read the chat request body: {error}");
-    let status = if error.into_inner().is::<LengthLimitError>() {
-        StatusCode::PAYLOAD_TOO_LARGE
-    } else {
-        StatusCode::BAD_REQUEST
-    };
-    (
-        status,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-                "param": null,
-                "code": "invalid_request_error",
-            }
-        })),
-    )
-        .into_response()
-}
-
 /// Write the measured count into the body's `vllm_xargs`, returning it when
 /// the body changed. A caller's own value for the key is replaced: the count
 /// is this server's measure of its own template, not a request parameter.
-fn mark_generation_prompt(body: &mut Bytes, boundary: &Boundary) -> Option<usize> {
-    let mut value: Value = serde_json::from_slice(body).ok()?;
-    let tokens = boundary.generation_prompt_tokens(&value)?;
+pub(crate) fn mark(value: &mut Value, boundary: &Boundary) -> Option<usize> {
+    let tokens = boundary.generation_prompt_tokens(value)?;
     value
         .as_object_mut()?
         .entry("vllm_xargs")
         .or_insert_with(|| json!({}))
         .as_object_mut()?
         .insert(GENERATION_PROMPT_TOKENS.to_string(), json!(tokens));
-    // Serializing a `Value` into a `Vec` cannot fail: every key is already a
-    // string, and a non-finite number degrades to `null`.
-    *body = Bytes::from(serde_json::to_vec(&value).expect("a serde_json::Value serializes"));
     Some(tokens)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
-    use std::fmt::Write;
+    use std::fmt::Write as _;
+    use std::sync::Arc;
 
     use vllm_chat::ChatRenderer;
     use vllm_chat::RenderedPrompt;
@@ -341,27 +250,26 @@ mod tests {
         }
     }
 
-    fn boundary() -> Boundary {
+    pub(crate) fn boundary() -> Boundary {
         Boundary {
             renderer: Arc::new(Template),
             tokenizer: Arc::new(Words),
         }
     }
 
-    fn mark(json: &str) -> (Option<usize>, Value) {
-        let mut body = Bytes::from(json.to_string());
-        let changed = mark_generation_prompt(&mut body, &boundary());
-        let value = serde_json::from_slice(&body).expect("body stays valid JSON");
+    fn mark_json(json: &str) -> (Option<usize>, Value) {
+        let mut value = serde_json::from_str(json).expect("test body is JSON");
+        let changed = mark(&mut value, &boundary());
         (changed, value)
     }
 
     #[test]
     fn the_generation_prompt_is_the_tail_the_history_rendering_lacks() {
-        let (changed, value) = mark(r#"{"messages":[{"role":"user","content":"hi there"}]}"#);
+        let (changed, value) = mark_json(r#"{"messages":[{"role":"user","content":"hi there"}]}"#);
         assert_eq!(changed, Some(2), "<assistant> <think>");
         assert_eq!(value["vllm_xargs"][GENERATION_PROMPT_TOKENS], json!(2));
 
-        let (changed, _) = mark(
+        let (changed, _) = mark_json(
             r#"{"messages":[{"role":"system","content":"s"},{"role":"tool","content":"out","tool_call_id":"c1"}]}"#,
         );
         assert_eq!(changed, Some(2), "the last message alone decides");
@@ -369,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_token_straddling_the_boundary_is_counted_as_generation_prompt() {
-        let (changed, _) = mark(r#"{"messages":[{"role":"user","content":"hi ~"}]}"#);
+        let (changed, _) = mark_json(r#"{"messages":[{"role":"user","content":"hi ~"}]}"#);
         assert_eq!(
             changed,
             Some(1),
@@ -379,11 +287,12 @@ mod tests {
 
     #[test]
     fn a_request_without_a_generation_prompt_is_all_history() {
-        let (changed, _) =
-            mark(r#"{"messages":[{"role":"user","content":"hi"}],"add_generation_prompt":false}"#);
+        let (changed, _) = mark_json(
+            r#"{"messages":[{"role":"user","content":"hi"}],"add_generation_prompt":false}"#,
+        );
         assert_eq!(changed, Some(0));
 
-        let (changed, _) = mark(
+        let (changed, _) = mark_json(
             r#"{"messages":[{"role":"assistant","content":"so"}],"continue_final_message":true}"#,
         );
         assert_eq!(changed, Some(0));
@@ -391,7 +300,7 @@ mod tests {
 
     #[test]
     fn the_mark_joins_the_callers_xargs_and_replaces_its_own_key() {
-        let (changed, value) = mark(
+        let (changed, value) = mark_json(
             r#"{"messages":[{"role":"user","content":"hi"}],"vllm_xargs":{"kv_transfer_params":1,"generation_prompt_tokens":99}}"#,
         );
         assert_eq!(changed, Some(2));
@@ -409,7 +318,7 @@ mod tests {
             r#"{"messages":[{"content":"no role"}]}"#,
             r#"{"messages":[{"role":"user","content":"hi"}],"vllm_xargs":7}"#,
         ] {
-            let (changed, value) = mark(json);
+            let (changed, value) = mark_json(json);
             assert_eq!(changed, None, "{json}");
             assert_eq!(
                 value,
@@ -417,80 +326,5 @@ mod tests {
                 "{json}"
             );
         }
-        let mut body = Bytes::from_static(b"not json at all");
-        assert_eq!(mark_generation_prompt(&mut body, &boundary()), None);
-        assert_eq!(&body[..], b"not json at all");
-    }
-
-    /// Drive the real middleware and return what the caller would see.
-    async fn chat_post(body: Body) -> (StatusCode, Value) {
-        use tower::ServiceExt as _;
-
-        let app = mark_history(
-            Router::new().route(
-                CHAT_COMPLETIONS_PATH,
-                axum::routing::post(|| async { "ok" }),
-            ),
-            Some(Arc::new(boundary())),
-        );
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(CHAT_COMPLETIONS_PATH)
-            .body(body)
-            .expect("request builds");
-        let response = app
-            .oneshot(request)
-            .await
-            .expect("the middleware always answers");
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("response body reads");
-        let body =
-            serde_json::from_slice(&bytes).expect("the error body is the OpenAI JSON envelope");
-        (status, body)
-    }
-
-    fn assert_error_envelope(body: &Value, cause: &str) {
-        assert_eq!(
-            body["error"]["type"],
-            json!("invalid_request_error"),
-            "{body}"
-        );
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains(cause)),
-            "the cause must survive in the envelope: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_oversized_chat_body_is_rejected_as_payload_too_large() {
-        use futures::StreamExt as _;
-
-        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
-        let chunks = BODY_LIMIT / chunk.len() + 2;
-        let body = Body::from_stream(
-            futures::stream::repeat_with(move || Ok::<Bytes, std::io::Error>(chunk.clone()))
-                .take(chunks),
-        );
-        let (status, body) = chat_post(body).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_error_envelope(&body, "length limit exceeded");
-    }
-
-    #[tokio::test]
-    async fn a_truncated_chat_body_keeps_the_bad_request_category_and_the_cause() {
-        let frames = vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from_static(br#"{"messages":["#)),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed before the body completed",
-            )),
-        ];
-        let (status, body) = chat_post(Body::from_stream(futures::stream::iter(frames))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_error_envelope(&body, "connection closed before the body completed");
     }
 }

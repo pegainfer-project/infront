@@ -28,6 +28,8 @@ use infront_engine::Scheduler;
 use infront_engine::SchedulerMetrics;
 use infront_engine::StopPolicy;
 use infront_engine::spawn_scheduler;
+use infront_vllm::Capabilities;
+use infront_vllm::ServeOptions;
 
 /// A `config.json` plus a byte-level tokenizer: what the frontend needs to
 /// render and detokenize.
@@ -135,13 +137,19 @@ async fn main() -> anyhow::Result<()> {
         "serving the echo model on port {} (model={:?}); Ctrl-C to stop",
         args.port, args.served_model_name,
     );
+    let options = ServeOptions {
+        served_model_names: vec![args.served_model_name],
+        port: args.port,
+        // An echo has no logits to report and nothing to draw.
+        capabilities: Capabilities {
+            logprobs: false,
+            sampling: false,
+        },
+        ..ServeOptions::new(args.model_path.display().to_string())
+    };
     infront_vllm::serve(
         std::future::ready(Ok(engine)),
-        &args.model_path,
-        vec![args.served_model_name],
-        infront_vllm::ParserSelection::Auto,
-        args.port,
-        None,
+        options,
         infront_vllm::shutdown_token_from_ctrl_c(),
     )
     .await
