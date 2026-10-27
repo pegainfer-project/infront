@@ -37,6 +37,7 @@ use vllm_engine_core_client::protocol::output::RequestBatchOutputs;
 use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -49,7 +50,7 @@ use super::connect_link;
 use super::engine_output;
 use super::now_secs_f64;
 use super::send_outputs;
-use super::send_terminal_output;
+use super::send_refusal;
 use super::send_utility_response;
 use crate::history::GENERATION_PROMPT_TOKENS;
 use crate::wire::convert_sampling;
@@ -324,43 +325,10 @@ impl SteppedEngineBridge {
             sampling_params,
             ..
         } = request;
-        let Some(prompt_tokens) = prompt_token_ids else {
-            warn!("request {request_id} dropped: missing prompt_token_ids");
-            return send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            );
+        let (prompt_tokens, sampling_params) = match admissible(prompt_token_ids, sampling_params) {
+            Ok(admitted) => admitted,
+            Err(reason) => return send_refusal(self.engine_index, output_tx, request_id, reason),
         };
-        let Some(sampling_params) = sampling_params else {
-            warn!("request {request_id} dropped: missing sampling_params");
-            return send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            );
-        };
-
-        if let Some(unsupported) = crate::wire::unsupported_request_params(&sampling_params) {
-            warn!("request {request_id} rejected: {unsupported}");
-            return send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            );
-        }
 
         let extra_arg = |key: &str| {
             sampling_params
@@ -388,6 +356,20 @@ impl SteppedEngineBridge {
         names.insert(request_id.clone(), control.id());
         streams.insert(control.id(), SteppedStream::new(request_id, control));
         Ok(())
+    }
+}
+
+/// The request's prompt and sampling parameters, or why the contract cannot
+/// serve it.
+fn admissible(
+    prompt: Option<Vec<u32>>,
+    params: Option<EngineCoreSamplingParams>,
+) -> Result<(Vec<u32>, EngineCoreSamplingParams), String> {
+    let prompt = prompt.ok_or("missing prompt_token_ids")?;
+    let params = params.ok_or("missing sampling_params")?;
+    match crate::wire::unsupported_request_params(&params) {
+        Some(reason) => Err(reason),
+        None => Ok((prompt, params)),
     }
 }
 
@@ -582,7 +564,6 @@ mod tests {
     use infront_engine::TokenLogprob;
     use infront_engine::scheduler_pair;
     use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
-    use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
     use super::*;
 
@@ -719,6 +700,14 @@ mod tests {
             assert_eq!(
                 batch.outputs[0].finish_reason,
                 Some(EngineCoreFinishReason::Error)
+            );
+            assert!(
+                matches!(
+                    &batch.outputs[0].stop_reason,
+                    Some(StopReason::Text(reason)) if reason.contains("negative logprob")
+                ),
+                "the refusal carries its reason: {:?}",
+                batch.outputs[0].stop_reason
             );
         }
     }
