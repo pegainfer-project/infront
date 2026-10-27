@@ -53,13 +53,13 @@ let engine = Engine {
     schedulers: vec![spawn_scheduler("my-engine", MyScheduler::new(...))],
     info: EngineInfo { kv_capacity: None, servable_len: None },
 };
+let options = ServeOptions {
+    served_model_names: vec!["my-model".into()],
+    ..ServeOptions::new(model_path) // config.json + tokenizer + chat template
+};
 infront_vllm::serve(
     std::future::ready(Ok(engine)),
-    model_path,                 // config.json + tokenizer + chat template
-    vec!["my-model".into()],
-    infront_vllm::ParserSelection::Auto,
-    8000,
-    None,
+    options,
     infront_vllm::shutdown_token_from_ctrl_c(),
 )
 .await
@@ -68,6 +68,14 @@ infront_vllm::serve(
 `serve` takes the engine as a future: HTTP starts loading the tokenizer and
 templates while weights load, and the port only accepts requests once the
 engine has registered.
+
+`ServeOptions` also declares what the engine serves. An engine without
+logits sets `capabilities.logprobs = false`, one that only decodes greedily
+sets `capabilities.sampling = false`, and a request asking for either is
+refused with a 400 before it reaches the engine. An engine whose state cannot
+roll back sets `history_boundary` to receive, on each chat request, where the
+conversation ends and the generation prompt begins
+(`Request::history_tokens`).
 
 A complete, runnable engine is [`examples/echo-server.rs`](./infront-vllm/examples/echo-server.rs):
 a scheduler that echoes the prompt back, no GPU or weights.
