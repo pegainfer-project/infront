@@ -8,15 +8,12 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use fastrace::Span;
-use fastrace::collector::SpanContext;
 use infront_engine::FinishReason;
 use infront_engine::KvCapacity;
 use infront_engine::Request;
@@ -27,6 +24,7 @@ use infront_engine::SchedulerHandle;
 use infront_engine::StepOutputs;
 use infront_engine::StopCause;
 use infront_engine::Terminal;
+use log::debug;
 use log::info;
 use log::warn;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +58,6 @@ use crate::history::GENERATION_PROMPT_TOKENS;
 use crate::wire::convert_finish_reason;
 use crate::wire::convert_sampling;
 use crate::wire::convert_stop_policy;
-use crate::wire::lora_adapter_from_sampling_params;
 use crate::wire::requested_logprobs;
 use crate::wire::requested_prompt_logprobs;
 use crate::wire::to_wire_position_logprobs;
@@ -242,7 +239,6 @@ impl SteppedEngineBridge {
                 outputs.push(output);
             }
             if terminated {
-                // Dropping the state ends the root span, closing the trace.
                 let state = streams.remove(&id).expect("terminated stream present");
                 names.remove(&state.request_id);
                 finished_requests.insert(state.request_id);
@@ -369,29 +365,12 @@ impl SteppedEngineBridge {
             );
         }
 
-        let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                let message = error.to_string();
-                warn!("request {request_id} rejected: {message}");
-                return send_terminal_output(
-                    self.engine_index,
-                    output_tx,
-                    request_id,
-                    EngineCoreFinishReason::Error,
-                    Some(StopReason::Text(message)),
-                    None,
-                    None,
-                );
-            }
-        };
         let extra_arg = |key: &str| {
             sampling_params
                 .extra_args
                 .as_ref()
                 .and_then(|args| args.get(key))
         };
-        let kv_transfer_params = extra_arg("kv_transfer_params").cloned();
         // The chat layer measured the generation prompt's token count at the
         // tail of a prompt only it saw as text; a count the prompt cannot hold
         // is no boundary.
@@ -407,17 +386,6 @@ impl SteppedEngineBridge {
             &sampling_params.stop_token_ids,
         );
 
-        // Open the request's root span before submit so its context travels
-        // into the scheduler as the parent of the queue/prefill/decode spans;
-        // noop (no allocation, `from_span` yields `None`) when tracing is off.
-        let trace_root = if infront_engine::tracing_state::is_enabled() {
-            Span::root("request", SpanContext::random())
-                .with_property(|| ("request_id", request_id.clone()))
-        } else {
-            Span::noop()
-        };
-        let trace_parent = SpanContext::from_span(&trace_root);
-
         let control = self.scheduler.submit(Request {
             prompt_tokens,
             // Keep the legacy SamplingParams lowering unchanged for stepped
@@ -427,18 +395,15 @@ impl SteppedEngineBridge {
             history_tokens,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
-            lora_adapter,
-            kv_transfer_params,
             logprobs: requested_logprobs(&sampling_params),
             prompt_logprobs: requested_prompt_logprobs(&sampling_params),
-            trace_parent,
-            client_label: Some(Arc::from(request_id.as_str())),
         });
 
+        debug!("request {request_id} submitted as {}", control.id());
         names.insert(request_id.clone(), control.id());
         streams.insert(
             control.id(),
-            SteppedStream::new(request_id, control, trace_root, stop_sentinel_id),
+            SteppedStream::new(request_id, control, stop_sentinel_id),
         );
         Ok(())
     }
@@ -457,26 +422,14 @@ struct SteppedStream {
     prompt_tokens: Option<usize>,
     cached_tokens: usize,
     prefill_stats_sent: bool,
-    /// P/D handoff metadata can arrive in an update with no token or
-    /// terminal, so retain it until the next output carries it to the router.
-    kv_transfer_params: Option<serde_json::Value>,
     /// Compatibility sentinel for stepped producers that predate typed
     /// [`StopCause`]. New producers must include their triggering token in the
     /// update and therefore bypass this fallback.
     stop_sentinel_id: Option<u32>,
-    /// Request-lifetime root span; held only for its `Drop`, which closes the
-    /// trace when the stream state is removed.
-    #[allow(dead_code)]
-    trace_root: Span,
 }
 
 impl SteppedStream {
-    fn new(
-        request_id: String,
-        control: RequestControl,
-        trace_root: Span,
-        stop_sentinel_id: Option<u32>,
-    ) -> Self {
+    fn new(request_id: String, control: RequestControl, stop_sentinel_id: Option<u32>) -> Self {
         Self {
             request_id,
             control,
@@ -484,9 +437,7 @@ impl SteppedStream {
             prompt_tokens: None,
             cached_tokens: 0,
             prefill_stats_sent: false,
-            kv_transfer_params: None,
             stop_sentinel_id,
-            trace_root,
         }
     }
 
@@ -528,7 +479,7 @@ impl SteppedStream {
 }
 
 /// Translate one request's step record into at most one wire output. A
-/// record carrying only metadata (scheduled, cached, kv-transfer) ships
+/// record carrying only metadata (scheduled, cached) ships
 /// nothing; its facts wait in `state` for the first real output. Returns
 /// `(output, terminated)`.
 fn reduce_update(
@@ -551,9 +502,6 @@ fn reduce_update(
     }
     if let Some(cached) = update.cached_tokens {
         state.cached_tokens = cached;
-    }
-    if let Some(params) = update.kv_transfer {
-        state.kv_transfer_params = Some(params);
     }
     let prompt_logprobs = match update.prompt_echo.map(to_wire_prompt_logprobs).transpose() {
         Ok(payload) => payload.flatten(),
@@ -631,7 +579,6 @@ fn reduce_update(
         state.take_prefill_stats(),
     );
     output.new_prompt_logprobs_tensors = prompt_logprobs;
-    output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
     (Some(output), terminated)
 }
 
@@ -662,6 +609,7 @@ impl UnixAnchor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     use infront_engine::PromptEcho;
@@ -682,12 +630,8 @@ mod tests {
             history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
-            lora_adapter: None,
-            kv_transfer_params: None,
             logprobs: None,
             prompt_logprobs: None,
-            trace_parent: None,
-            client_label: None,
         }
     }
 
@@ -695,7 +639,7 @@ mod tests {
     fn unsupported_rejection_is_rendered_for_vllm() {
         let (handle, _backend) = scheduler_pair();
         let control = handle.submit(request());
-        let mut stream = SteppedStream::new("unsupported".into(), control, Span::noop(), None);
+        let mut stream = SteppedStream::new("unsupported".into(), control, None);
         let mut update = infront_engine::testing::empty_update(stream.control.id());
         update.terminal = Some(Terminal::Rejected {
             reason: RejectReason::Unsupported {
@@ -745,7 +689,7 @@ mod tests {
         });
         let mut streams = HashMap::from([(
             control.id(),
-            SteppedStream::new("scheduled".into(), control, Span::noop(), None),
+            SteppedStream::new("scheduled".into(), control, None),
         )]);
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -871,7 +815,7 @@ mod tests {
         let id = RequestId::new(7);
         let control =
             infront_engine::testing::request_control(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-7".to_string(), control, Span::noop(), None);
+        let mut state = SteppedStream::new("request-7".to_string(), control, None);
 
         let mut update = infront_engine::testing::empty_update(id);
         update.tokens = vec![11, 43];
@@ -913,7 +857,7 @@ mod tests {
         let id = RequestId::new(8);
         let control =
             infront_engine::testing::request_control(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-8".to_string(), control, Span::noop(), None);
+        let mut state = SteppedStream::new("request-8".to_string(), control, None);
 
         let mut update = infront_engine::testing::empty_update(id);
         update.tokens = vec![2];
@@ -939,8 +883,7 @@ mod tests {
         let id = RequestId::new(9);
         let control =
             infront_engine::testing::request_control(id, Arc::new(AtomicBool::new(false)));
-        let mut state =
-            SteppedStream::new("request-9".to_string(), control, Span::noop(), Some(99));
+        let mut state = SteppedStream::new("request-9".to_string(), control, Some(99));
 
         let mut update = infront_engine::testing::empty_update(id);
         update.tokens = vec![11];

@@ -27,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
 use tokio_util::sync::WaitForCancellationFuture;
 
-use super::control::LoraClient;
 use super::kv::KvCapacity;
 use super::ledger::RequestLedger;
 use super::metrics::SchedulerMetrics;
@@ -147,9 +146,6 @@ pub struct Engine {
     /// they mean is the engine's business.
     pub schedulers: Vec<LiveScheduler>,
     pub info: EngineInfo,
-    /// LoRA adapter control, for engines that serve it. The `Option` is the
-    /// capability — no separate flag exists to disagree with it.
-    pub lora: Option<LoraClient>,
 }
 
 pub struct LiveScheduler {

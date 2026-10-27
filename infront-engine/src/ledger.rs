@@ -4,8 +4,7 @@
 //! One account per unanswered request. The driver opens it at
 //! [`RequestLedger::register`]; exactly one terminal transition closes it
 //! ([`RequestLedger::finish`], [`RequestLedger::fail`],
-//! [`RequestLedger::reject`], [`RequestLedger::retire`], or
-//! [`RequestLedger::defer_finish`]); accounts still open when the ledger
+//! [`RequestLedger::reject`], or [`RequestLedger::retire`]); accounts still open when the ledger
 //! drops are written off as `Failed` terminals (engine teardown). Because
 //! every open is a submit and every close is a terminal, "terminal exactly
 //! once" and "nothing after the terminal" are enforced here: touching a
@@ -25,7 +24,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::request_lifecycle::DeferredFinish;
 use super::request_lifecycle::RequestEnvelope;
 use super::request_lifecycle::StepSender;
 use super::step::FinishReason;
@@ -85,7 +83,7 @@ impl StepStatement {
             .expect("indexed step entry was extracted without index cleanup")
     }
 
-    /// Remove a request's buffered record (deferred finish, retire).
+    /// Remove a request's buffered record (retire).
     fn extract(&mut self, id: RequestId) -> Option<RequestUpdate> {
         let slot = self.index.remove(&id)?;
         self.buffer[slot].take()
@@ -230,12 +228,6 @@ impl RequestLedger {
         self.statement.entry(id).prompt_echo = Some(echo);
     }
 
-    /// Attach P/D handoff metadata to this step's record.
-    pub fn kv_transfer(&mut self, id: RequestId, params: serde_json::Value) {
-        assert!(self.is_active(id), "kv_transfer on {id} before admission");
-        self.statement.entry(id).kv_transfer = Some(params);
-    }
-
     // ── Terminal transitions ────────────────────────────────────────────
 
     /// Finish the request. Token counts come from the ledger's tally.
@@ -283,39 +275,6 @@ impl RequestLedger {
             account.completion_tokens()
         );
         self.statement.extract(id);
-    }
-
-    /// Turn the request's finish into a token the scheduler can deliver later
-    /// from any thread (P/D prefill roles gate `Finished` on KV-save
-    /// visibility). Closes the account; the request's buffered update for
-    /// this step — tokens included — folds into the returned message, so late
-    /// delivery cannot reorder against the step stream.
-    pub fn defer_finish(&mut self, id: RequestId, reason: FinishReason) -> DeferredFinish {
-        self.defer_finish_with_cause(id, reason, None)
-    }
-
-    /// Defer a finish while preserving a typed token-level stop cause.
-    pub fn defer_finish_with_cause(
-        &mut self,
-        id: RequestId,
-        reason: FinishReason,
-        stop_cause: Option<StopCause>,
-    ) -> DeferredFinish {
-        let account = self.close(id);
-        let AccountState::Active { completion_tokens } = account.state else {
-            panic!("defer_finish on {id} before admission");
-        };
-        let mut update = self
-            .statement
-            .extract(id)
-            .unwrap_or_else(|| RequestUpdate::empty(id));
-        update.terminal = Some(Terminal::Finished {
-            reason,
-            stop_cause,
-            prompt_tokens: account.prompt_len,
-            completion_tokens,
-        });
-        DeferredFinish::new(update, self.tx.clone())
     }
 
     // ── Driver face ─────────────────────────────────────────────────────
@@ -407,12 +366,8 @@ mod tests {
             history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens: 8,
-            lora_adapter: None,
-            kv_transfer_params: None,
             logprobs: None,
             prompt_logprobs: None,
-            trace_parent: None,
-            client_label: None,
         }
     }
 
@@ -496,42 +451,6 @@ mod tests {
         // Scheduled was buffered before the retire extracted the entry, so
         // nothing observable remains this step.
         assert!(handle_steps(handle).try_recv().is_err());
-    }
-
-    #[test]
-    fn defer_finish_folds_step_output_and_delivers_late() {
-        let (handle, mut backend) = scheduler_pair();
-        let _control = handle.submit(request(vec![1, 2]));
-        let envelope = backend.submissions.try_recv().expect("envelope");
-        let id = backend.ledger.register(envelope).id;
-        backend.ledger.admit(id);
-        backend.ledger.push_tokens(id, &[7], &[]);
-        let deferred = backend
-            .ledger
-            .defer_finish_with_cause(id, FinishReason::Length, None);
-        backend.ledger.commit_step(false);
-
-        let mut steps = handle_steps(handle);
-        // The request's whole record rode into the deferred finish; the step
-        // itself shipped nothing.
-        assert!(steps.try_recv().is_err());
-
-        std::thread::spawn(move || deferred.send())
-            .join()
-            .expect("deferred sender thread");
-        let step = steps.try_recv().expect("late finish message");
-        let update = &step.updates[0];
-        assert!(update.scheduled.is_some());
-        assert_eq!(update.tokens, vec![7]);
-        assert!(matches!(
-            update.terminal,
-            Some(Terminal::Finished {
-                reason: FinishReason::Length,
-                stop_cause: None,
-                prompt_tokens: 2,
-                completion_tokens: 1,
-            })
-        ));
     }
 
     #[test]

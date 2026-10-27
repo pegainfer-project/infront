@@ -52,7 +52,6 @@ discipline.
 let engine = Engine {
     schedulers: vec![spawn_scheduler("my-engine", MyScheduler::new(...))],
     info: EngineInfo { kv_capacity: None, servable_len: None },
-    lora: None,
 };
 infront_vllm::serve(
     std::future::ready(Ok(engine)),

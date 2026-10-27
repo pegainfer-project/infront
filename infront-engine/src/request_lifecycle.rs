@@ -1,4 +1,4 @@
-//! Submission envelope and late-delivery handles for one request's lifetime.
+//! Submission envelope and abort handle for one request's lifetime.
 //!
 //! The scheduler side of the contract deals in plain [`RequestId`]s against
 //! the [`super::RequestLedger`] — no per-request typestate handles cross the
@@ -11,12 +11,9 @@
 //!   [`super::RequestLedger::register`]. It covers the window where the
 //!   request exists but no ledger account does yet: sitting in the submit
 //!   channel, or sent to a scheduler thread that already exited.
-//! - [`DeferredFinish`] — a finish extracted from the ledger for delivery
-//!   from another thread at a later time (P/D prefill roles withhold
-//!   `Finished` until the step's KV saves are peer-visible).
 //! - [`RequestControl`] — the frontend's per-request abort flag.
 //!
-//! The first two hold `Option<inner>` for one reason only: Rust's `Drop`
+//! The envelope holds `Option<inner>` for one reason only: Rust's `Drop`
 //! cannot move fields out, so a consuming transition `take`s the inner and
 //! the drop bomb fires on `Some`. An unanswered request must surface as a
 //! `Failed` terminal, never a client hang.
@@ -33,7 +30,7 @@ use super::step::StepOutputs;
 use super::step::Terminal;
 
 /// The scheduler-to-frontend stream: one message per step. The ledger holds
-/// the sender; drop bombs and deferred finishes hold clones for solo sends.
+/// the sender; drop bombs hold clones for solo sends.
 pub(crate) type StepSender = tokio::sync::mpsc::UnboundedSender<StepOutputs>;
 pub type StepReceiver = tokio::sync::mpsc::UnboundedReceiver<StepOutputs>;
 
@@ -94,78 +91,6 @@ impl Drop for RequestEnvelope {
         });
         let _ = inner.tx.send(StepOutputs {
             updates: vec![update],
-        });
-    }
-}
-
-/// A finish whose delivery the scheduler handed off (e.g. a P/D prefill role
-/// withholding `Finished` until this step's KV saves are peer-visible). Made
-/// by [`super::RequestLedger::defer_finish`], which closes the request's
-/// ledger account and folds its already-buffered step record — tokens
-/// included — into this message, so sending it from any thread at any later
-/// time cannot reorder against the step stream: the whole per-request record
-/// travels as one entry.
-pub struct DeferredFinish {
-    /// `Some` until [`Self::send`] delivers; `Drop` fires on `Some`.
-    inner: Option<DeferredInner>,
-}
-
-pub(crate) struct DeferredInner {
-    pub(crate) update: RequestUpdate,
-    pub(crate) tx: StepSender,
-}
-
-impl DeferredFinish {
-    pub(crate) fn new(update: RequestUpdate, tx: StepSender) -> Self {
-        Self {
-            inner: Some(DeferredInner { update, tx }),
-        }
-    }
-
-    fn inner(&self) -> &DeferredInner {
-        self.inner
-            .as_ref()
-            .expect("deferred finish accessed after consumption")
-    }
-
-    pub fn id(&self) -> RequestId {
-        self.inner().update.id
-    }
-
-    /// Deliver the terminal. Consumes the finish.
-    pub fn send(mut self) {
-        let inner = self.inner.take().expect("deferred finish sent twice");
-        let _ = inner.tx.send(StepOutputs {
-            updates: vec![inner.update],
-        });
-    }
-}
-
-/// The same drop bomb as the submission envelope: an unsent deferred finish
-/// is a holder bug, and it must surface as a finished stream, not a client
-/// hang. The buffered tokens still ship, but the terminal is rewritten to
-/// `Failed` — the withheld `Finished` doubles as a barrier signal (P/D
-/// KV-ready), so a dropped handle must not fake its success.
-impl Drop for DeferredFinish {
-    fn drop(&mut self) {
-        let Some(mut inner) = self.inner.take() else {
-            return;
-        };
-        let (prompt_tokens, completion_tokens) = match inner.update.terminal {
-            Some(Terminal::Finished {
-                prompt_tokens,
-                completion_tokens,
-                ..
-            }) => (prompt_tokens, completion_tokens),
-            _ => (0, inner.update.tokens.len()),
-        };
-        inner.update.terminal = Some(Terminal::Failed {
-            message: "deferred finish dropped by the engine before delivery".to_string(),
-            prompt_tokens,
-            completion_tokens,
-        });
-        let _ = inner.tx.send(StepOutputs {
-            updates: vec![inner.update],
         });
     }
 }

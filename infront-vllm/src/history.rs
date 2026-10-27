@@ -31,6 +31,8 @@
 
 use std::sync::Arc;
 
+use axum::Error as AxumError;
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -39,10 +41,13 @@ use axum::extract::Request;
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::http::Method;
+use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
 use axum::middleware;
 use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::response::Response;
+use http_body_util::LengthLimitError;
 use log::debug;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -60,9 +65,12 @@ use vllm_text::Prompt;
 use vllm_text::TextDecodeOptions;
 use vllm_text::tokenizer::DynTokenizer;
 
-use super::reasoning_effort::BODY_LIMIT;
-use super::reasoning_effort::CHAT_COMPLETIONS_PATH;
-use super::reasoning_effort::body_read_error;
+/// The only route whose prompt has a generation prompt to measure.
+const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+
+/// The body is buffered to be rewritten, and an oversized request must not be
+/// silently truncated.
+const BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// The `vllm_xargs` key carrying the generation prompt's token count from
 /// this layer to the bridge.
@@ -229,6 +237,31 @@ async fn mark_request(
         .await
 }
 
+/// The route's error contract: the same OpenAI-style JSON envelope the
+/// upstream routes answer with (`vllm_server`'s `ApiError::to_error_response`,
+/// which is not exported). 413 belongs to the length-limit rejection alone;
+/// any other read failure is a 400.
+fn body_read_error(error: AxumError) -> Response {
+    let message = format!("failed to read the chat request body: {error}");
+    let status = if error.into_inner().is::<LengthLimitError>() {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request_error",
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Write the measured count into the body's `vllm_xargs`, returning it when
 /// the body changed. A caller's own value for the key is replaced: the count
 /// is this server's measure of its own template, not a request parameter.
@@ -387,5 +420,77 @@ mod tests {
         let mut body = Bytes::from_static(b"not json at all");
         assert_eq!(mark_generation_prompt(&mut body, &boundary()), None);
         assert_eq!(&body[..], b"not json at all");
+    }
+
+    /// Drive the real middleware and return what the caller would see.
+    async fn chat_post(body: Body) -> (StatusCode, Value) {
+        use tower::ServiceExt as _;
+
+        let app = mark_history(
+            Router::new().route(
+                CHAT_COMPLETIONS_PATH,
+                axum::routing::post(|| async { "ok" }),
+            ),
+            Some(Arc::new(boundary())),
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(CHAT_COMPLETIONS_PATH)
+            .body(body)
+            .expect("request builds");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("the middleware always answers");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body reads");
+        let body =
+            serde_json::from_slice(&bytes).expect("the error body is the OpenAI JSON envelope");
+        (status, body)
+    }
+
+    fn assert_error_envelope(body: &Value, cause: &str) {
+        assert_eq!(
+            body["error"]["type"],
+            json!("invalid_request_error"),
+            "{body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(cause)),
+            "the cause must survive in the envelope: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_chat_body_is_rejected_as_payload_too_large() {
+        use futures::StreamExt as _;
+
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let chunks = BODY_LIMIT / chunk.len() + 2;
+        let body = Body::from_stream(
+            futures::stream::repeat_with(move || Ok::<Bytes, std::io::Error>(chunk.clone()))
+                .take(chunks),
+        );
+        let (status, body) = chat_post(body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_error_envelope(&body, "length limit exceeded");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_chat_body_keeps_the_bad_request_category_and_the_cause() {
+        let frames = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(br#"{"messages":["#)),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before the body completed",
+            )),
+        ];
+        let (status, body) = chat_post(Body::from_stream(futures::stream::iter(frames))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error_envelope(&body, "connection closed before the body completed");
     }
 }
