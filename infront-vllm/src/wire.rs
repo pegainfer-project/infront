@@ -1,6 +1,5 @@
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::bail;
 use anyhow::ensure;
 use infront_engine::EosPolicy;
 use infront_engine::FinishReason;
@@ -14,8 +13,6 @@ use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
 use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogprob;
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
-
-pub(crate) const LORA_ADAPTER_XARG: &str = "infront_lora_adapter";
 
 /// A sampled position: the chosen token, then its top-k without repeating it.
 /// The chat renderer takes the first `k` entries as the alternatives, so a
@@ -176,28 +173,25 @@ pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> O
             params.repetition_penalty
         ));
     }
-    // The server lowers the client's ec_transfer_params into extra_args, and
-    // this engine has no encoder cache connector to hand it to.
-    if let Some(ec) = params
-        .extra_args
-        .as_ref()
-        .and_then(|args| args.get("ec_transfer_params"))
-    {
-        let requested = match ec {
-            serde_json::Value::Null => false,
-            serde_json::Value::Object(map) => !map.is_empty(),
-            _ => true,
-        };
-        if requested {
-            return Some(
-                "ec_transfer_params is not supported yet: this engine has no encoder cache \
-                 connector"
-                    .to_string(),
-            );
-        }
-    }
-    None
+    // The server lowers the client's transfer params into extra_args, and the
+    // contract has no connector to hand them to.
+    TRANSFER_PARAMS
+        .iter()
+        .find(|key| {
+            params
+                .extra_args
+                .as_ref()
+                .and_then(|args| args.get(**key))
+                .is_some_and(|value| match value {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::Object(map) => !map.is_empty(),
+                    _ => true,
+                })
+        })
+        .map(|key| format!("{key} is not supported: the engine contract has no transfer connector"))
 }
+
+const TRANSFER_PARAMS: [&str; 2] = ["kv_transfer_params", "ec_transfer_params"];
 
 pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
     params.logprobs.map(|count| count as usize)
@@ -205,22 +199,6 @@ pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> Option<us
 
 pub(crate) fn requested_prompt_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
     params.prompt_logprobs.map(|count| count as usize)
-}
-
-pub(crate) fn lora_adapter_from_sampling_params(
-    params: &EngineCoreSamplingParams,
-) -> Result<Option<String>> {
-    let Some(extra_args) = params.extra_args.as_ref() else {
-        return Ok(None);
-    };
-    let Some(value) = extra_args.get(LORA_ADAPTER_XARG) else {
-        return Ok(None);
-    };
-    match value.as_str() {
-        Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
-        Some(_) => bail!("{LORA_ADAPTER_XARG} must not be empty"),
-        None => bail!("{LORA_ADAPTER_XARG} must be a string"),
-    }
 }
 
 pub(crate) fn convert_finish_reason(reason: FinishReason) -> EngineCoreFinishReason {
@@ -356,41 +334,18 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_ec_transfer_params_is_refused_not_dropped() {
-        let mut params = EngineCoreSamplingParams::for_test();
-        params.extra_args = Some(HashMap::from([(
-            "ec_transfer_params".to_string(),
-            serde_json::json!({"requested": true}),
-        )]));
-        let refusal = unsupported_request_params(&params).expect("must refuse");
-        assert!(refusal.contains("ec_transfer_params"));
-
-        params.extra_args = Some(HashMap::from([(
-            "ec_transfer_params".to_string(),
-            serde_json::json!({}),
-        )]));
-        assert_eq!(unsupported_request_params(&params), None);
-        params.extra_args = Some(HashMap::from([(
-            "ec_transfer_params".to_string(),
-            serde_json::Value::Null,
-        )]));
-        assert_eq!(unsupported_request_params(&params), None);
-    }
-
-    #[test]
-    fn lora_adapter_from_sampling_params_reads_proxy_xarg() {
-        let mut params = EngineCoreSamplingParams::for_test();
-        params.extra_args = Some(HashMap::from([(
-            LORA_ADAPTER_XARG.to_string(),
-            serde_json::Value::String("adapter-a".to_string()),
-        )]));
-
-        assert_eq!(
-            lora_adapter_from_sampling_params(&params)
-                .expect("extract adapter")
-                .as_deref(),
-            Some("adapter-a")
-        );
+    fn nonempty_transfer_params_are_refused_not_dropped() {
+        for key in TRANSFER_PARAMS {
+            let with = |value| {
+                let mut params = EngineCoreSamplingParams::for_test();
+                params.extra_args = Some(HashMap::from([(key.to_string(), value)]));
+                unsupported_request_params(&params)
+            };
+            let refusal = with(serde_json::json!({"requested": true})).expect("must refuse");
+            assert!(refusal.contains(key));
+            assert_eq!(with(serde_json::json!({})), None);
+            assert_eq!(with(serde_json::Value::Null), None);
+        }
     }
 
     fn assert_logprob_eq(actual: f32, expected: f32) {

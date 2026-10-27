@@ -9,7 +9,6 @@ version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
-fastrace = { workspace = true }
 http-body-util = { workspace = true }
 infront-engine = { workspace = true }
 log = { workspace = true }
@@ -17,10 +16,8 @@ rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }
 vllm-chat = { workspace = true }
 vllm-engine-core-client = { workspace = true }
@@ -32,7 +29,7 @@ zeromq = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 infront-engine = { workspace = true, features = ["testing"] }
-tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

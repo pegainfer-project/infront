@@ -126,7 +126,6 @@ async fn main() -> anyhow::Result<()> {
             kv_capacity: None,
             servable_len: None,
         },
-        lora: None,
     };
     eprintln!(
         "serving the echo model on port {} (model={:?}); Ctrl-C to stop",

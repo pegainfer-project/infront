@@ -73,21 +73,10 @@ pub struct Request {
     pub history_tokens: Option<usize>,
     pub stop_policy: StopPolicy,
     pub max_tokens: usize,
-    pub lora_adapter: Option<String>,
-    /// Opaque router/P-D metadata from the request's
-    /// `vllm_xargs.kv_transfer_params`.
-    pub kv_transfer_params: Option<serde_json::Value>,
     /// Completion top-k count: None disables scoring; Some(0) scores the chosen token.
     pub logprobs: Option<usize>,
     /// Prompt top-k count, independent of completion scoring; Some(0) scores each prompt token.
     pub prompt_logprobs: Option<usize>,
-    /// Trace context of the caller's request span, when tracing is on. The
-    /// model scheduler opens its queue/prefill/decode spans as children of
-    /// this. `None` when tracing is disabled.
-    pub trace_parent: Option<fastrace::collector::SpanContext>,
-    /// External request name for scheduler-side logs only; never used for
-    /// routing (that is [`RequestId`]).
-    pub client_label: Option<std::sync::Arc<str>>,
 }
 
 /// One submitted request as the scheduler receives it: the id of its open
@@ -127,9 +116,6 @@ pub struct RequestUpdate {
     pub cached_tokens: Option<usize>,
     /// Echoed prompt, once, when the request's prefill completes.
     pub prompt_echo: Option<PromptEcho>,
-    /// Opaque P/D handoff metadata forwarded through the protocol stack's
-    /// `kv_transfer_params` response field.
-    pub kv_transfer: Option<serde_json::Value>,
     /// End of the request's lifetime. No later step mentions this id again.
     pub terminal: Option<Terminal>,
 }
@@ -143,7 +129,6 @@ impl RequestUpdate {
             logprobs: Vec::new(),
             cached_tokens: None,
             prompt_echo: None,
-            kv_transfer: None,
             terminal: None,
         }
     }
@@ -156,7 +141,6 @@ impl RequestUpdate {
             && self.tokens.is_empty()
             && self.cached_tokens.is_none()
             && self.prompt_echo.is_none()
-            && self.kv_transfer.is_none()
             && self.terminal.is_none()
     }
 }
@@ -207,8 +191,6 @@ pub enum RejectReason {
         prompt_tokens: usize,
         worst_case_tokens: usize,
     },
-    /// The named adapter is not loaded on this engine.
-    UnknownLoraAdapter { name: String },
     /// The request asks for a feature this engine does not implement.
     Unsupported { feature: String },
 }
@@ -249,9 +231,6 @@ impl fmt::Display for RejectReason {
                 "request requires more KV blocks than this model instance can provide: \
                  prompt_tokens={prompt_tokens}, max_request_tokens={worst_case_tokens}"
             ),
-            Self::UnknownLoraAdapter { name } => {
-                write!(f, "LoRA adapter is not loaded: {name}")
-            }
             Self::Unsupported { feature } => {
                 write!(f, "this engine does not support {feature}")
             }

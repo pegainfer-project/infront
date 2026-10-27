@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::fd::IntoRawFd;
@@ -14,7 +13,6 @@ use axum::Router;
 use infront_engine::Engine;
 use log::warn;
 use serde::Deserialize;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use vllm_chat::LoadModelBackendsOptions;
 use vllm_chat::load_model_backends;
@@ -33,19 +31,11 @@ use vllm_text::backend::hf::HfOverrides;
 
 mod bridge;
 mod history;
-mod lora;
-mod reasoning_effort;
-mod request_contract;
 mod wire;
 
 use bridge::SteppedEngineBridge;
 use bridge::ipc_endpoint;
 use bridge::local_ipc_namespace;
-pub use lora::LoraModule;
-use lora::load_startup_lora_modules;
-use lora::lora_openai_routes;
-use lora::lora_routes;
-pub use lora::parse_lora_modules_arg;
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {
@@ -123,7 +113,7 @@ pub async fn serve_with_engine_count(
 /// Serve as [`serve_with_engine_count`] does, behind the caller's routes:
 /// `extend_router` takes the vLLM router and returns the one that listens.
 /// An engine refuses what it does not serve here, with a 400 before the
-/// request reaches it, as the prefill-only contract does.
+/// request reaches it.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_router_extension<F>(
     engine: impl Future<Output = Result<Engine>> + Send + 'static,
@@ -150,79 +140,6 @@ where
         engine_count,
         shutdown,
         extend_router,
-    )
-    .await
-}
-
-/// Serve an endpoint that requires `max_tokens=1`.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve_prefill_only_with_engine_count(
-    engine: impl Future<Output = Result<Engine>> + Send + 'static,
-    model_path: &Path,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    port: u16,
-    max_model_len: Option<u32>,
-    engine_count: usize,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    serve_with_router_extension(
-        engine,
-        model_path,
-        served_model_name,
-        tool_call_parser,
-        port,
-        max_model_len,
-        engine_count,
-        shutdown,
-        request_contract::prefill_only_routes,
-    )
-    .await
-}
-
-pub async fn serve_model_with_lora_routes(
-    engine: Engine,
-    model_id: impl Into<String>,
-    served_model_name: Vec<String>,
-    tool_call_parser: ParserSelection,
-    lora_modules: Vec<LoraModule>,
-    port: u16,
-    max_model_len: u32,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let model_id = model_id.into();
-    let adapter_names = Arc::new(RwLock::new(HashSet::new()));
-    // The Option is the capability: only engines that minted a LoRA channel
-    // can serve these routes.
-    let control = engine
-        .lora
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("engine does not expose LoRA adapter control"))?;
-    load_startup_lora_modules(&control, &adapter_names, &lora_modules).await?;
-    let base_model_name = served_model_name
-        .first()
-        .cloned()
-        .unwrap_or_else(|| model_id.clone());
-    serve_model_on_host_with_router_extension(
-        std::future::ready(Ok(engine)),
-        model_id,
-        served_model_name.clone(),
-        tool_call_parser,
-        "0.0.0.0".to_string(),
-        port,
-        max_model_len,
-        1,
-        shutdown,
-        move |router| {
-            let lora_router = lora_routes(control, Arc::clone(&adapter_names));
-            let openai_router = lora_openai_routes(
-                router.clone(),
-                base_model_name,
-                served_model_name,
-                Arc::clone(&adapter_names),
-            );
-            openai_router.merge(lora_router).fallback_service(router)
-        },
     )
     .await
 }
@@ -382,9 +299,9 @@ where
         }
     });
 
-    // The two request-shaping layers read the served checkpoint's template and
-    // tokenizer, loaded once here; the server loads its own afterwards and
-    // reports its own error if the model is genuinely broken.
+    // The history layer reads the served checkpoint's template and tokenizer,
+    // loaded once here; the server loads its own afterwards and reports its
+    // own error if the model is genuinely broken.
     let backends = match load_model_backends(
         &model_id,
         LoadModelBackendsOptions {
@@ -400,7 +317,6 @@ where
             None
         }
     };
-    let effort_aliases = reasoning_effort::probe_effort_aliases(&model_id, backends.as_ref());
     let boundary = backends.map(|b| Arc::new(history::Boundary::new(&b)));
 
     let config = Config {
@@ -430,8 +346,6 @@ where
         chat_template: None,
         default_chat_template_kwargs: None,
         limit_mm_per_prompt: HashMap::new(),
-        // Startup adapters go through the engine-side LoRA channel
-        // (`load_startup_lora_modules`), never the upstream static loader.
         lora_modules: Vec::new(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
@@ -460,12 +374,7 @@ where
     };
 
     let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
-        // Effort normalization is outermost so the boundary measures the
-        // template under the value the route will render with.
-        reasoning_effort::normalize_chat_requests(
-            history::mark_history(extend_router(router), boundary),
-            effort_aliases,
-        )
+        history::mark_history(extend_router(router), boundary)
     })
     .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),

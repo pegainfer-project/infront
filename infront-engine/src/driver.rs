@@ -4,9 +4,9 @@
 //! (drain order, one metrics publish and one commit per iteration, shutdown
 //! and fatal handling) are code, not per-crate discipline. An engine's
 //! runtime obligation is exactly the three [`Scheduler`] methods. Anything
-//! beyond them (e.g. LoRA control) is not the contract's business: a
-//! scheduler that serves an extra capability captures its own channel before
-//! spawn and drains it inside `step`.
+//! beyond them is not the contract's business: a scheduler that serves an
+//! extra capability captures its own channel before spawn and drains it
+//! inside `step`.
 
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ pub trait Scheduler: Send {
 
 /// Longest an idle driver waits for a submission before stepping again. Bounds
 /// how late an idle scheduler sees work that does not arrive as a submission
-/// (e.g. LoRA control).
+/// (e.g. its own control channel).
 pub const IDLE_PARK: Duration = Duration::from_millis(1);
 
 /// Spawn one scheduler: mint the wiring, start the driver thread, return the
@@ -191,12 +191,8 @@ mod tests {
             history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
             logprobs: None,
             prompt_logprobs: None,
-            trace_parent: None,
-            client_label: None,
         }
     }
 
