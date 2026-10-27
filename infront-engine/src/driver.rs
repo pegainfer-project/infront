@@ -8,6 +8,8 @@
 //! scheduler that serves an extra capability captures its own channel before
 //! spawn and drains it inside `step`.
 
+use std::time::Duration;
+
 use super::ledger::RequestLedger;
 use super::metrics::SchedulerMetrics;
 use super::step::QueuedRequest;
@@ -27,18 +29,27 @@ pub trait Scheduler: Send {
     fn submit(&mut self, request: QueuedRequest);
 
     /// Advance one step: admission, GPU work, and per-request ledger writes.
-    /// The driver loops over this without pause — an idle scheduler returns
-    /// quickly and gets polled again, so in-flight completions from the
-    /// scheduler's own worker threads are picked up within a step. Recoverable
+    /// While [`Self::metrics`] reports running or waiting requests the driver
+    /// loops over this without pause, so in-flight completions from the
+    /// scheduler's own worker threads are picked up within a step. An idle
+    /// scheduler is stepped again on its next submission or after
+    /// [`IDLE_PARK`], whichever comes first. Recoverable
     /// execution failures are the scheduler's to absorb (fail the touched
     /// requests, keep serving); `Err` means the engine is beyond use. The
     /// driver then writes off every open account with the error and winds
     /// down.
     fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()>;
 
-    /// Metrics snapshot; the driver publishes it once per iteration.
+    /// Metrics snapshot; the driver publishes it once per iteration. Work
+    /// that only [`Self::step`] can collect counts as running or waiting, or
+    /// the driver parks over it.
     fn metrics(&self) -> SchedulerMetrics;
 }
+
+/// Longest an idle driver waits for a submission before stepping again. Bounds
+/// how late an idle scheduler sees work that does not arrive as a submission
+/// (e.g. LoRA control).
+pub const IDLE_PARK: Duration = Duration::from_millis(1);
 
 /// Spawn one scheduler: mint the wiring, start the driver thread, return the
 /// frontend end. `name` names the OS thread (shows in `top`/gdb).
@@ -53,9 +64,9 @@ pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> Live
 
 /// The polling loop. Exits when the frontend is gone (submission channel
 /// disconnected) and the scheduler reports itself drained, or when `step`
-/// reports a fatal error. An idle iteration (nothing running or waiting) ends
-/// in a [`std::hint::spin_loop`] before the next probe; busy iterations never
-/// pause.
+/// reports a fatal error. After an idle iteration (nothing running or
+/// waiting) the driver parks on the submission channel for up to
+/// [`IDLE_PARK`]; busy iterations never pause.
 pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
     let SchedulerBackend {
         submissions,
@@ -64,7 +75,20 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
         exit_guard: _exit_guard,
     } = backend;
     let mut submissions_open = true;
+    let mut idle = false;
     loop {
+        if idle {
+            match submissions.recv_timeout(IDLE_PARK) {
+                Ok(envelope) => {
+                    let queued = ledger.register(envelope);
+                    scheduler.submit(queued);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    submissions_open = false;
+                }
+            }
+        }
         loop {
             match submissions.try_recv() {
                 Ok(envelope) => {
@@ -91,21 +115,20 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
             ledger.commit_step(false);
             return;
         }
-        if snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0 {
-            if !submissions_open {
-                log::info!("scheduler drained after frontend shutdown, exiting");
-                return;
-            }
-            // The iteration did no work; relax the core's issue slots before
-            // probing again. Latency is untouched — busy iterations never
-            // reach this hint.
-            std::hint::spin_loop();
+        idle = snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0;
+        if idle && !submissions_open {
+            log::info!("scheduler drained after frontend shutdown, exiting");
+            return;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use super::super::step::Request;
     use super::super::step::RequestId;
     use super::super::step::Terminal;
@@ -301,6 +324,41 @@ mod tests {
         drop(handle);
         drop(resume_tx);
         join.join().expect("driver drains after cancellation");
+    }
+
+    #[test]
+    fn idle_driver_parks_between_steps() {
+        struct IdleScheduler(Arc<AtomicUsize>);
+
+        impl Scheduler for IdleScheduler {
+            fn submit(&mut self, _request: QueuedRequest) {}
+
+            fn step(&mut self, _ledger: &mut RequestLedger) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+
+            fn metrics(&self) -> SchedulerMetrics {
+                SchedulerMetrics::default()
+            }
+        }
+
+        let steps = Arc::new(AtomicUsize::new(0));
+        let window = Duration::from_millis(200);
+        let partition = spawn_scheduler("test-idle", IdleScheduler(Arc::clone(&steps)));
+        std::thread::sleep(window);
+        let observed = steps.load(Ordering::Relaxed);
+        drop(partition.handle);
+        partition
+            .join
+            .join()
+            .expect("idle driver exits on shutdown");
+
+        let parks = (window.as_micros() / IDLE_PARK.as_micros()) as usize;
+        assert!(
+            observed <= 2 * parks,
+            "an idle driver must park between steps: {observed} steps in {window:?}"
+        );
     }
 
     #[test]
