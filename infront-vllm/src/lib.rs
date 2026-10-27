@@ -15,12 +15,15 @@ use tokio_util::sync::CancellationToken;
 use vllm_chat::LoadModelBackendsOptions;
 use vllm_chat::load_model_backends;
 use vllm_engine_core_client::TransportMode;
+use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputBackend;
 use vllm_server::ApiServerOptions;
 use vllm_server::ChatTemplateContentFormatOption;
 use vllm_server::Config;
 use vllm_server::CoordinatorMode;
 use vllm_server::CorsConfig;
+use vllm_server::CustomHistogramBuckets;
 use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
+use vllm_server::DEFAULT_LOG_STATS_INTERVAL;
 use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
 pub use vllm_server::ParserSelection;
@@ -267,6 +270,8 @@ pub async fn serve(
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
         revision: None,
+        tokenizer: None,
+        hf_config: None,
         hf_overrides: HfOverrides::default(),
         generation_config: GenerationConfigMode::Auto,
         served_model_name: served_model_names,
@@ -274,9 +279,12 @@ pub async fn serve(
         tool_call_parser,
         reasoning_parser: ParserSelection::default(),
         tool_strict_level: None,
+        structured_outputs_backend: StructuredOutputBackend::default(),
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
+        trust_request_chat_template: false,
+        exclude_tools_when_tool_choice_none: false,
         limit_mm_per_prompt: HashMap::new(),
         lora_modules: Vec::new(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
@@ -287,15 +295,15 @@ pub async fn serve(
         api_server_options: ApiServerOptions {
             enable_log_requests: true,
             enable_prompt_tokens_details: true,
-            enable_request_id_headers: false,
-            enable_scale_out: false,
-            enable_per_request_metrics: false,
-            sse_keep_alive_interval: None,
+            ..ApiServerOptions::default()
         },
         // Upstream ties the scheduler-stats and request-event metric recorders
         // to this flag, and the bridge's stats are what `/metrics` exports; the
         // periodic stats log line comes with it.
         disable_log_stats: false,
+        custom_histogram_buckets: CustomHistogramBuckets::default(),
+        log_stats_interval: Some(DEFAULT_LOG_STATS_INTERVAL),
+        disable_request_id_randomization: false,
         grpc_listener_mode: None,
         manages_engine: false,
         shutdown_timeout: Duration::from_secs(10),

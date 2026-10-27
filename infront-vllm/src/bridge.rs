@@ -238,6 +238,7 @@ async fn connect_link(
         kv_events_config: None,
         weight_transfer_backend: None,
         enable_sleep_mode: false,
+        vllm_config: None,
         supports_draft_weight_updates: false,
     };
     info!(
