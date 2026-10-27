@@ -82,14 +82,15 @@ curl localhost:8000/v1/completions -H 'content-type: application/json' \
 ## Building
 
 The toolchain is pinned in [`rust-toolchain.toml`](./rust-toolchain.toml); the
-vLLM crates need `protoc`.
+vLLM crates need `protoc`, and linting needs
+[`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny).
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --locked
-scripts/echo_smoke.sh
+cargo x lint    # fmt, clippy, cargo-deny; --fix applies fixes
+cargo x test    # workspace tests and the echo-server smoke test
 ```
+
+See [`AGENTS.md`](./AGENTS.md) for contribution conventions.
 
 ## Status
 

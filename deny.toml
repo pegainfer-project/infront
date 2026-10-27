@@ -1,0 +1,39 @@
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled in by tokenizers via vLLM" },
+  { id = "RUSTSEC-2026-0249", reason = "smartstring is unmaintained; pulled in by serde-json-fmt via vLLM" },
+  { id = "RUSTSEC-2026-0391", reason = "fixed only in zstd 0.14; oss-harmony via vLLM pins 0.13" },
+  { id = "RUSTSEC-2026-0398", reason = "fixed only in zstd-safe 8.2; oss-harmony via vLLM pins zstd 0.13" },
+  { id = "RUSTSEC-2026-0403", reason = "fixed only in zstd-safe 8.2; oss-harmony via vLLM pins zstd 0.13" },
+]
+yanked = "deny"
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.93
+
+[sources]
+allow-git = [
+  "https://github.com/oss-harmony/harmony",
+  "https://github.com/smg-project/llm-multimodal",
+  "https://github.com/vllm-project/vllm",
+  "https://github.com/zeromq/zmq.rs",
+]
+unknown-git = "deny"
+unknown-registry = "deny"
