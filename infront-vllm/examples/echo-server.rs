@@ -13,6 +13,12 @@
 //!     -d '{"model": "echo", "prompt": "hello, infront", "max_tokens": 64}'
 //!
 //!   # the completion text is the prompt back: "hello, infront"
+//!
+//!   curl http://127.0.0.1:8000/v1/chat/completions \
+//!     -H 'content-type: application/json' \
+//!     -d '{"model": "echo", "messages": [{"role": "user", "content": "hello"}]}'
+//!
+//!   # the fixture's chat template concatenates the messages, so the reply is "hello"
 
 use std::path::PathBuf;
 
@@ -31,8 +37,8 @@ use infront_engine::spawn_scheduler;
 use infront_vllm::Capabilities;
 use infront_vllm::ServeOptions;
 
-/// A `config.json` plus a byte-level tokenizer: what the frontend needs to
-/// render and detokenize.
+/// A `config.json`, a byte-level tokenizer and a chat template: what the
+/// frontend needs to render and detokenize.
 const FIXTURE_MODEL_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/echo-model");
 
 #[derive(Parser)]
