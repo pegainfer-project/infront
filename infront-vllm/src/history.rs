@@ -136,9 +136,12 @@ impl Boundary {
             .get("parallel_tool_calls")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        // Bounded before rendering: a turn the template rejects still costs
+        // its rendering.
         let ends = (0..messages.len().saturating_sub(1))
             .rev()
-            .filter(|&i| messages[i + 1].role() == ChatRole::Assistant);
+            .filter(|&i| messages[i + 1].role() == ChatRole::Assistant)
+            .take(MARKS);
         let options = ChatOptions {
             generation_prompt_mode: GenerationPromptMode::NoGenerationPrompt,
             ..chat_options(body)
@@ -150,7 +153,6 @@ impl Boundary {
             Some(self.render(turn, options.clone(), context)?.len())
         })
         .filter(|&m| m > 0)
-        .take(MARKS)
         .collect()
     }
 
@@ -396,6 +398,8 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fmt::Write as _;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use vllm_chat::ChatRenderer;
     use vllm_chat::RenderedPrompt;
@@ -552,6 +556,48 @@ pub(crate) mod tests {
             r#"{"tools":[{"type":"function","function":{"name":"grep"}}],"messages":[{"role":"system","content":"s"},{"role":"user","content":"a"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"grep","arguments":"{}"}}]},{"role":"tool","content":"out","tool_call_id":"c1"},{"role":"assistant","content":"done"},{"role":"user","content":"b"}]}"#,
         );
         assert_eq!(value["vllm_xargs"][HISTORY_MARKS], json!([11, 7]));
+    }
+
+    /// The test template, counting its renderings and rejecting every
+    /// conversation that opens with `reject`.
+    struct Rejecting(Arc<AtomicUsize>);
+
+    impl ChatRenderer for Rejecting {
+        fn render(&self, request: &ChatRequest) -> vllm_chat::Result<RenderedPrompt> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            match request.messages[0].text_content()?.as_str() {
+                "reject" => Err(vllm_chat::Error::ChatTemplate("rejected".to_string())),
+                _ => Template.render(request),
+            }
+        }
+    }
+
+    #[test]
+    fn turns_the_template_rejects_count_towards_the_marks_measured() {
+        // Every earlier turn of twenty fails to render; they cost the last
+        // message's two renderings and the newest eight turns' only.
+        let first = json!({"role":"user","content":"reject"});
+        let turns = (0..20).flat_map(|_| {
+            [
+                json!({"role":"assistant","content":"a"}),
+                json!({"role":"user","content":"u"}),
+            ]
+        });
+        let mut value =
+            json!({"messages": std::iter::once(first).chain(turns).collect::<Vec<_>>()});
+        let renders = Arc::new(AtomicUsize::new(0));
+        let boundary = Boundary {
+            renderer: Arc::new(Rejecting(Arc::clone(&renders))),
+            ..boundary()
+        };
+        assert_eq!(mark(&mut value, &boundary), Some(2));
+        assert_eq!(
+            (
+                value["vllm_xargs"][HISTORY_MARKS].clone(),
+                renders.load(Ordering::Relaxed)
+            ),
+            (json!([]), 2 + MARKS)
+        );
     }
 
     #[test]
