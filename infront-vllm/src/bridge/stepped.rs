@@ -53,6 +53,7 @@ use super::send_outputs;
 use super::send_refusal;
 use super::send_utility_response;
 use crate::history::GENERATION_PROMPT_TOKENS;
+use crate::history::HISTORY_MARKS;
 use crate::wire::convert_sampling;
 use crate::wire::convert_stop_policy;
 use crate::wire::requested_logprobs;
@@ -342,10 +343,24 @@ impl SteppedEngineBridge {
         let history_tokens = extra_arg(GENERATION_PROMPT_TOKENS)
             .and_then(serde_json::Value::as_u64)
             .and_then(|tail| prompt_tokens.len().checked_sub(tail as usize));
+        // The earlier turns' ends the chat layer measured, kept where they
+        // fall inside this turn's history.
+        let history_marks = extra_arg(HISTORY_MARKS)
+            .and_then(serde_json::Value::as_array)
+            .map(|marks| {
+                marks
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|m| m as usize)
+                    .filter(|&m| m > 0 && history_tokens.is_some_and(|h| m < h))
+                    .collect()
+            })
+            .unwrap_or_default();
         let control = self.scheduler.submit(Request {
             prompt_tokens,
             params: convert_sampling(&sampling_params),
             history_tokens,
+            history_marks,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             logprobs: requested_logprobs(&sampling_params),
@@ -572,6 +587,7 @@ mod tests {
             prompt_tokens: vec![1, 2],
             params: infront_engine::SamplingParams::default(),
             history_tokens: None,
+            history_marks: Vec::new(),
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
             logprobs: None,

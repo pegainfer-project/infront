@@ -73,9 +73,11 @@ engine has registered.
 logits sets `capabilities.logprobs = false`, one that only decodes greedily
 sets `capabilities.sampling = false`, and a request asking for either is
 refused with a 400 before it reaches the engine. An engine whose state cannot
-roll back sets `history_boundary` to receive, on each chat request, where the
-conversation ends and the generation prompt begins
-(`Request::history_tokens`).
+roll back sets `history: History::Boundary` to receive, on each chat request,
+where the conversation ends and the generation prompt begins
+(`Request::history_tokens`); `History::Marks` adds where the earlier turns
+ended (`Request::history_marks`), for an engine that keeps snapshots beyond
+the instance that made them.
 
 A complete, runnable engine is [`examples/echo-server.rs`](./infront-vllm/examples/echo-server.rs):
 a scheduler that echoes the prompt back, no GPU or weights.
