@@ -74,10 +74,25 @@ pub struct ServeOptions {
     /// [`Engine::schedulers`].
     pub engine_count: NonZeroUsize,
     pub capabilities: Capabilities,
-    /// Measure each chat prompt's history boundary into
-    /// [`infront_engine::Request::history_tokens`], at one render and
-    /// tokenization of the last message per chat request.
-    pub history_boundary: bool,
+    pub history: History,
+}
+
+/// What the frontend measures of each chat prompt's history, for an engine
+/// whose state cannot roll back.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum History {
+    /// Nothing: [`infront_engine::Request::history_tokens`] is `None` and
+    /// [`infront_engine::Request::history_marks`] empty.
+    #[default]
+    Unmeasured,
+    /// Where the conversation ends and the generation prompt begins, into
+    /// `history_tokens`, at one render and tokenization of the last message.
+    Boundary,
+    /// The boundary, and where the earlier turns ended into `history_marks`,
+    /// for an engine that keeps snapshots beyond the instance that made them.
+    /// Costs a render and tokenization of the conversation up to each of the
+    /// newest eight earlier turns.
+    Marks,
 }
 
 impl ServeOptions {
@@ -91,7 +106,7 @@ impl ServeOptions {
             max_model_len: None,
             engine_count: NonZeroUsize::MIN,
             capabilities: Capabilities::default(),
-            history_boundary: false,
+            history: History::Unmeasured,
         }
     }
 }
@@ -114,7 +129,7 @@ pub async fn serve(
         max_model_len,
         engine_count,
         capabilities,
-        history_boundary,
+        history,
     } = options;
     let max_model_len = resolve_max_model_len(Path::new(&model_id), max_model_len);
     let engine_count = engine_count.get();
@@ -234,7 +249,9 @@ pub async fn serve(
     // The history measure reads the served checkpoint's template and
     // tokenizer, loaded once here; the server loads its own afterwards and
     // reports its own error if the model is genuinely broken.
-    let boundary = if history_boundary {
+    let boundary = if history == History::Unmeasured {
+        None
+    } else {
         match load_model_backends(
             &model_id,
             LoadModelBackendsOptions {
@@ -244,14 +261,12 @@ pub async fn serve(
         )
         .await
         {
-            Ok(backends) => Some(history::Boundary::new(&backends)),
+            Ok(backends) => history::Boundary::new(&backends, history),
             Err(error) => {
                 warn!("history boundary disabled: backends for {model_id} did not load: {error}");
                 None
             }
         }
-    } else {
-        None
     };
 
     let config = Config {
