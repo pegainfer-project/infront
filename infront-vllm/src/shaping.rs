@@ -1,8 +1,10 @@
 //! What the HTTP layer does to a generate request before vLLM's routes see
-//! it: refuse what the engine declared it does not serve, with a 400 naming
-//! the parameter, and mark a chat prompt's history boundary when the engine
-//! asked for it. The body is read and parsed once for both; a body that is
-//! not JSON passes through untouched for the route to report.
+//! it: refuse what no engine contract carries and what the engine declared it
+//! does not serve, with a 400 naming the parameter, and mark a chat prompt's
+//! history boundary when the engine asked for it. A parameter refused past
+//! this point, at the bridge, can only fail the request as an internal error,
+//! mid-stream for a streamed one. The body is read and parsed once for both;
+//! a body that is not JSON passes through untouched for the route to report.
 
 use std::sync::Arc;
 
@@ -46,6 +48,61 @@ const LOGPROBS: [&str; 2] = ["logprobs", "prompt_logprobs"];
 /// Below this a temperature is greedy, as [`infront_engine::SamplingParams`]
 /// reads it.
 const GREEDY_BELOW: f64 = 1e-5;
+
+/// Penalties no engine contract carries, each at the value that asks for
+/// none.
+const PENALTIES: [(&str, f64); 3] = [
+    ("frequency_penalty", 0.0),
+    ("presence_penalty", 0.0),
+    ("repetition_penalty", 1.0),
+];
+
+/// Why `body` asks for what no engine contract carries, if it does: the
+/// parameters [`crate::wire::unsupported_request_params`] refuses at the
+/// bridge, read off the body instead. The penalty comparisons are exact for
+/// the same reason they are there.
+#[allow(clippy::float_cmp)]
+fn unservable(body: &Value) -> Option<String> {
+    let number = |key: &str| body.get(key).and_then(Value::as_f64);
+    let every_logprob = || {
+        LOGPROBS.into_iter().find_map(|key| {
+            body.get(key)
+                .and_then(Value::as_i64)
+                .filter(|&count| count < 0)
+                .map(|count| format!("{key} {count} is not supported: name a count of top tokens"))
+        })
+    };
+    let min_p = || {
+        number("min_p")
+            .filter(|p| !(0.0..1.0).contains(p))
+            .map(|p| format!("min_p {p} outside [0, 1)"))
+    };
+    let penalty = || {
+        PENALTIES.into_iter().find_map(|(key, none)| {
+            number(key)
+                .filter(|&value| value != none)
+                .map(|value| format!("{key} {value} is not supported"))
+        })
+    };
+    let transfer = || {
+        crate::wire::TRANSFER_PARAMS
+            .into_iter()
+            .find(|key| {
+                body.get(key).is_some_and(|value| match value {
+                    Value::Null => false,
+                    Value::Object(map) => !map.is_empty(),
+                    _ => true,
+                })
+            })
+            .map(|key| {
+                format!("{key} is not supported: the engine contract has no transfer connector")
+            })
+    };
+    every_logprob()
+        .or_else(min_p)
+        .or_else(penalty)
+        .or_else(transfer)
+}
 
 /// What an engine serves beyond greedy generation. A request asking for more
 /// is refused with a 400 naming the parameter before it reaches the engine.
@@ -114,16 +171,12 @@ struct Shaping {
     boundary: Option<Arc<Boundary>>,
 }
 
-/// Wrap a router with the shaping layer; with every capability served and no
-/// boundary to measure there is nothing to do, and the router serves as is.
+/// Wrap a router with the shaping layer.
 pub(crate) fn shape(
     router: Router,
     capabilities: Capabilities,
     boundary: Option<Boundary>,
 ) -> Router {
-    if capabilities == Capabilities::default() && boundary.is_none() {
-        return router;
-    }
     let shaping = Arc::new(Shaping {
         capabilities,
         boundary: boundary.map(Arc::new),
@@ -152,7 +205,7 @@ async fn shape_request(
             .run(Request::from_parts(parts, Body::from(bytes)))
             .await;
     };
-    if let Some(reason) = shaping.capabilities.refusal(&value) {
+    if let Some(reason) = unservable(&value).or_else(|| shaping.capabilities.refusal(&value)) {
         return error_response(StatusCode::BAD_REQUEST, &reason);
     }
 
@@ -313,6 +366,65 @@ mod tests {
             Capabilities::default().refusal(&json!({"temperature": 0.7})),
             None
         );
+    }
+
+    #[test]
+    fn what_no_contract_carries_is_refused_by_the_key_that_asks() {
+        for (body, key) in [
+            (json!({"logprobs": -1}), "logprobs"),
+            (json!({"prompt_logprobs": -1}), "prompt_logprobs"),
+            (json!({"min_p": 1.0}), "min_p"),
+            (json!({"frequency_penalty": 0.5}), "frequency_penalty"),
+            (json!({"presence_penalty": -0.5}), "presence_penalty"),
+            (json!({"repetition_penalty": 1.1}), "repetition_penalty"),
+            (
+                json!({"kv_transfer_params": {"do_remote_prefill": true}}),
+                "kv_transfer_params",
+            ),
+            (
+                json!({"ec_transfer_params": {"x": 1}}),
+                "ec_transfer_params",
+            ),
+        ] {
+            let message = unservable(&body).expect("must refuse");
+            assert!(message.starts_with(key), "{message}");
+        }
+        for body in [
+            json!({}),
+            json!({"logprobs": 0, "prompt_logprobs": null, "min_p": 0.2}),
+            json!({"frequency_penalty": 0, "presence_penalty": null, "repetition_penalty": 1}),
+            json!({"kv_transfer_params": null, "ec_transfer_params": {}}),
+            json!({"min_tokens": 1, "max_tokens": 1}),
+        ] {
+            assert_eq!(unservable(&body), None, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_engine_serving_everything_still_refuses_what_no_contract_carries() {
+        for path in [COMPLETIONS_PATH, CHAT_COMPLETIONS_PATH] {
+            let (status, bytes) = post(
+                Capabilities::default(),
+                None,
+                path,
+                Body::from(r#"{"prompt":"hi","repetition_penalty":1.2}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(
+                error_message(status, &bytes).contains("repetition_penalty"),
+                "{path}"
+            );
+        }
+        let body = r#"{"prompt":"hi","stream":true,"min_tokens":1,"max_tokens":1}"#;
+        let (status, bytes) = post(
+            Capabilities::default(),
+            None,
+            CHAT_COMPLETIONS_PATH,
+            Body::from(body),
+        )
+        .await;
+        assert_eq!((status, &bytes[..]), (StatusCode::OK, body.as_bytes()));
     }
 
     #[tokio::test]

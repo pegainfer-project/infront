@@ -120,6 +120,9 @@ pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPoli
 /// [`StopPolicy`]; this helper only validates unrelated sampling/transfer
 /// fields that would otherwise be silently ignored.
 /// Returns the offending description; `None` means the request is servable.
+/// The HTTP layer refuses the same parameters with a 400 before a route
+/// lowers them; what reaches this check came from a default the route filled
+/// in (a model's generation config) or from a client speaking EngineCore.
 ///
 /// The float comparisons are exact on purpose: they detect "the client sent
 /// anything other than the wire default", not numeric closeness — a request
@@ -131,12 +134,6 @@ pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> O
         || params.prompt_logprobs.is_some_and(|count| count < 0)
     {
         return Some("negative logprob counts are not supported".into());
-    }
-    if params.min_tokens != 0 {
-        return Some(format!(
-            "min_tokens={} is not supported by current engine contracts",
-            params.min_tokens
-        ));
     }
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
@@ -177,7 +174,7 @@ pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> O
         .map(|key| format!("{key} is not supported: the engine contract has no transfer connector"))
 }
 
-const TRANSFER_PARAMS: [&str; 2] = ["kv_transfer_params", "ec_transfer_params"];
+pub(crate) const TRANSFER_PARAMS: [&str; 2] = ["kv_transfer_params", "ec_transfer_params"];
 
 pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
     params.logprobs.map(|count| count as usize)
@@ -266,10 +263,7 @@ mod tests {
         assert_eq!(unsupported_request_params(&params), None);
 
         params.min_tokens = 1;
-        assert_eq!(
-            unsupported_request_params(&params).as_deref(),
-            Some("min_tokens=1 is not supported by current engine contracts")
-        );
+        assert_eq!(unsupported_request_params(&params), None);
         params.min_tokens = 0;
 
         params.min_p = 0.2;

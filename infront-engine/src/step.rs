@@ -84,6 +84,11 @@ pub struct Request {
     pub history_marks: Vec<usize>,
     pub stop_policy: StopPolicy,
     pub max_tokens: usize,
+    /// Tokens the request generates before a stop token may end it; the
+    /// frontend validates it is at most `max_tokens`. vLLM masks stop tokens
+    /// out of the draw until then; a scheduler that cannot judges a stop token
+    /// drawn earlier an ordinary token.
+    pub min_tokens: usize,
     /// Completion top-k count: None disables scoring; Some(0) scores the chosen token.
     pub logprobs: Option<usize>,
     /// Prompt top-k count, independent of completion scoring; Some(0) scores each prompt token.

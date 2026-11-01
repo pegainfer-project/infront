@@ -363,6 +363,7 @@ impl SteppedEngineBridge {
             history_marks,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
+            min_tokens: sampling_params.min_tokens as usize,
             logprobs: requested_logprobs(&sampling_params),
             prompt_logprobs: requested_prompt_logprobs(&sampling_params),
         });
@@ -590,6 +591,7 @@ mod tests {
             history_marks: Vec::new(),
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
+            min_tokens: 0,
             logprobs: None,
             prompt_logprobs: None,
         }
@@ -726,6 +728,24 @@ mod tests {
                 batch.outputs[0].stop_reason
             );
         }
+    }
+
+    #[test]
+    fn min_tokens_reaches_the_scheduler() {
+        let (handle, mut backend) = scheduler_pair();
+        let bridge = bridge(handle);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = wire_request(None, None);
+        let params = request.sampling_params.as_mut().expect("sampling params");
+        (params.min_tokens, params.max_tokens) = (1, 1);
+        bridge
+            .start_request(request, &mut HashMap::new(), &mut HashMap::new(), &tx)
+            .unwrap();
+        let queued = backend.register_next().expect("submitted, not refused");
+        assert_eq!(
+            (queued.request.min_tokens, queued.request.max_tokens),
+            (1, 1)
+        );
     }
 
     fn prompt_update(id: RequestId, score: Option<TokenLogprob>) -> RequestUpdate {

@@ -72,7 +72,10 @@ engine has registered.
 `ServeOptions` also declares what the engine serves. An engine without
 logits sets `capabilities.logprobs = false`, one that only decodes greedily
 sets `capabilities.sampling = false`, and a request asking for either is
-refused with a 400 before it reaches the engine. An engine whose state cannot
+refused with a 400 before it reaches the engine, as is one asking for what
+no engine contract carries (penalties, transfer params, every token's
+logprob). `Request::min_tokens` is carried: a scheduler that cannot mask stop
+tokens out of the draw judges a stop token drawn before it an ordinary token. An engine whose state cannot
 roll back sets `history: History::Boundary` to receive, on each chat request,
 where the conversation ends and the generation prompt begins
 (`Request::history_tokens`); `History::Marks` adds where the earlier turns

@@ -351,6 +351,7 @@ mod tests {
             history_marks: Vec::new(),
             stop_policy: StopPolicy::default(),
             max_tokens: 8,
+            min_tokens: 0,
             logprobs: None,
             prompt_logprobs: None,
         }
