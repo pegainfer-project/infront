@@ -55,8 +55,9 @@ struct Args {
 /// Answers each request with its own prompt tokens, one per step, then the
 /// request's EOS: a model whose output is its input. Every token goes through
 /// the request's [`StopPolicy`] as a real model's would, so a stop token in
-/// the prompt ends the echo there; `max_tokens` cuts it short with
-/// `FinishReason::Length`, as does running out of script with EOS ignored.
+/// the prompt ends the echo there, unless fewer than `min_tokens` came before
+/// it; `max_tokens` cuts it short with `FinishReason::Length`, as does running
+/// out of script with EOS ignored or not yet allowed.
 /// One token per step keeps the per-token streaming path warm instead of
 /// collapsing the response into one batch.
 #[derive(Default)]
@@ -71,6 +72,7 @@ struct RunningRequest {
     script: Vec<u32>,
     stop_policy: StopPolicy,
     max_tokens: usize,
+    min_tokens: usize,
 }
 
 impl Scheduler for EchoScheduler {
@@ -94,6 +96,7 @@ impl Scheduler for EchoScheduler {
                 script: request.prompt_tokens.into_iter().chain(eos).rev().collect(),
                 stop_policy: request.stop_policy,
                 max_tokens: request.max_tokens,
+                min_tokens: request.min_tokens,
             });
         }
         let mut still_running = Vec::new();
@@ -107,8 +110,13 @@ impl Scheduler for EchoScheduler {
                 ledger.finish(id, FinishReason::Length);
                 continue;
             };
+            // A stop token drawn before `min_tokens` is an ordinary token.
+            let stops = ledger.completion_tokens(id) >= running.min_tokens;
             ledger.push_tokens(id, &[token], &[]);
-            if let Some(cause) = running.stop_policy.classify(token, |_| false) {
+            if let Some(cause) = stops
+                .then(|| running.stop_policy.classify(token, |_| false))
+                .flatten()
+            {
                 ledger.finish(id, FinishReason::Stop(cause));
             } else if ledger.completion_tokens(id) >= running.max_tokens {
                 ledger.finish(id, FinishReason::Length);
