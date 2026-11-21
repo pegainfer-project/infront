@@ -31,7 +31,8 @@ confidence-threshold = 0.93
 [sources]
 allow-git = [
   "https://github.com/oss-harmony/harmony",
-  "https://github.com/smg-project/llm-multimodal",
+  "https://github.com/smg-project/smg",
+  "https://github.com/vllm-project/rust-pcre2",
   "https://github.com/vllm-project/vllm",
   "https://github.com/zeromq/zmq.rs",
 ]

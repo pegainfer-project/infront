@@ -79,6 +79,7 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
             .num_accepted_tokens
             .saturating_sub(last.num_accepted_tokens),
         num_accepted_tokens_per_pos,
+        ..SpecDecodingStats::default()
     }
 }
 
@@ -246,6 +247,13 @@ async fn connect_link(
         enable_sleep_mode: false,
         vllm_config: None,
         supports_draft_weight_updates: false,
+        prefix_hash_config: None,
+        cache_config_info: None,
+        config_hash: None,
+        enable_expert_parallel: false,
+        supports_prompt_logprobs: true,
+        allow_missing_mm_embeddings: false,
+        max_mm_embeds_per_request: None,
     };
     info!(
         "local engine {engine_index} KV capacity: {kv_capacity:?} -> \
@@ -415,6 +423,7 @@ fn engine_output(
         spec_decode_metrics: None,
         prompt_token_id_logprobs: None,
         error: None,
+        watermarking: None,
     }
 }
 

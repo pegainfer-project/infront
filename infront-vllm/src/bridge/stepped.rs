@@ -40,6 +40,7 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
@@ -268,20 +269,22 @@ impl SteppedEngineBridge {
         >,
     ) -> Result<()> {
         let frames = message.into_vec();
-        if frames.len() != 2 {
+        if frames.len() < 2 {
             bail!(
-                "expected 2 local engine request frames, got {}",
+                "expected at least 2 local engine request frames, got {}",
                 frames.len()
             );
         }
 
         match frames[0].as_ref() {
             ty if ty == EngineCoreRequestType::Add.to_frame().as_ref() => {
-                let request: EngineCoreRequest =
-                    vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
+                let request = EngineCoreRequest::from_frames(&frames[1..])?;
                 self.start_request(request, streams, names, output_tx)
             }
             ty if ty == EngineCoreRequestType::Abort.to_frame().as_ref() => {
+                if frames.len() != 2 {
+                    bail!("expected 2 local engine abort frames, got {}", frames.len());
+                }
                 let request_ids: Vec<String> =
                     vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
                 for request_id in request_ids {
@@ -299,6 +302,12 @@ impl SteppedEngineBridge {
                 Ok(())
             }
             ty if ty == EngineCoreRequestType::Utility.to_frame().as_ref() => {
+                if frames.len() != 2 {
+                    bail!(
+                        "expected 2 local engine utility frames, got {}",
+                        frames.len()
+                    );
+                }
                 let (_client_index, call_id, method_name, _args): (
                     u32,
                     UtilityCallId,
@@ -378,10 +387,13 @@ impl SteppedEngineBridge {
 /// The request's prompt and sampling parameters, or why the contract cannot
 /// serve it.
 fn admissible(
-    prompt: Option<Vec<u32>>,
+    prompt: Option<WireNdArray>,
     params: Option<EngineCoreSamplingParams>,
 ) -> Result<(Vec<u32>, EngineCoreSamplingParams), String> {
-    let prompt = prompt.ok_or("missing prompt_token_ids")?;
+    let prompt = prompt
+        .ok_or("missing prompt_token_ids")?
+        .to_u32_vec()
+        .ok_or("invalid prompt_token_ids")?;
     let params = params.ok_or("missing sampling_params")?;
     match crate::wire::unsupported_request_params(&params) {
         Some(reason) => Err(reason),
@@ -687,7 +699,7 @@ mod tests {
         params.prompt_logprobs = prompt;
         EngineCoreRequest {
             request_id: "logprobs".into(),
-            prompt_token_ids: Some(vec![9, 8]),
+            prompt_token_ids: Some(vec![9, 8].into()),
             sampling_params: Some(params),
             ..Default::default()
         }
