@@ -16,6 +16,7 @@ use vllm_chat::LoadModelBackendsOptions;
 use vllm_chat::load_model_backends;
 use vllm_engine_core_client::TransportMode;
 use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputBackend;
+use vllm_server::AccessLogConfig;
 use vllm_server::ApiServerOptions;
 use vllm_server::ChatTemplateContentFormatOption;
 use vllm_server::Config;
@@ -24,6 +25,8 @@ use vllm_server::CorsConfig;
 use vllm_server::CustomHistogramBuckets;
 use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
 use vllm_server::DEFAULT_LOG_STATS_INTERVAL;
+use vllm_server::DefaultMmLoras;
+use vllm_server::FingerprintMode;
 use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
 pub use vllm_server::ParserSelection;
@@ -287,8 +290,11 @@ pub async fn serve(
         revision: None,
         tokenizer: None,
         hf_config: None,
+        skip_tokenizer_init: false,
+        hf_token: None,
         hf_overrides: HfOverrides::default(),
         generation_config: GenerationConfigMode::Auto,
+        override_generation_config: serde_json::Map::new(),
         served_model_name: served_model_names,
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser,
@@ -298,14 +304,20 @@ pub async fn serve(
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
+        reasoning_effort_map: HashMap::new(),
         trust_request_chat_template: false,
         exclude_tools_when_tool_choice_none: false,
         limit_mm_per_prompt: HashMap::new(),
+        mm_processor_kwargs: HashMap::new(),
         lora_modules: Vec::new(),
+        default_mm_loras: DefaultMmLoras::new(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,
+        fingerprint_mode: FingerprintMode::default(),
         cors: CorsConfig::default(),
+        access_log: AccessLogConfig::default(),
+        root_path: None,
         api_keys: Vec::new(),
         api_server_options: ApiServerOptions {
             enable_log_requests: true,
@@ -319,6 +331,7 @@ pub async fn serve(
         custom_histogram_buckets: CustomHistogramBuckets::default(),
         log_stats_interval: Some(DEFAULT_LOG_STATS_INTERVAL),
         disable_request_id_randomization: false,
+        keep_alive_on_engine_death: false,
         grpc_listener_mode: None,
         manages_engine: false,
         shutdown_timeout: Duration::from_secs(10),

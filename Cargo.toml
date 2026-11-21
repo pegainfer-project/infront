@@ -32,10 +32,15 @@ zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206
 ] }
 
 # vLLM's Rust frontend. Keep every crate on the same rev.
-vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "08b989da99f0c0c76520a47580de9c18137500c9" }
+vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "0bf9c07376a4091627e6cb50dd85464361db452c" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "0bf9c07376a4091627e6cb50dd85464361db452c" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "0bf9c07376a4091627e6cb50dd85464361db452c" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "0bf9c07376a4091627e6cb50dd85464361db452c" }
+
+# Mirrors vllm/rust/Cargo.toml: partial matching and match-time options for
+# vllm-parser's `hf` parser until released upstream.
+[patch.crates-io]
+pcre2 = { git = "https://github.com/vllm-project/rust-pcre2", rev = "bb2f377c9f919c881860c210fad8375945c90d43" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -2 }

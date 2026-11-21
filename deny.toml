@@ -5,6 +5,7 @@ ignore = [
   { id = "RUSTSEC-2026-0391", reason = "unreachable: affects Encoder/Decoder::with_context; zstd's only caller, oss-harmony, uses decode_all" },
   { id = "RUSTSEC-2026-0398", reason = "unreachable: affects Seekable, and the seekable feature is off" },
   { id = "RUSTSEC-2026-0403", reason = "unreachable: affects write::Decoder; oss-harmony uses decode_all on embedded vocab data" },
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vulnerability; chrono is pulled in by vllm-chat" },
 ]
 yanked = "deny"
 
@@ -31,7 +32,8 @@ confidence-threshold = 0.93
 [sources]
 allow-git = [
   "https://github.com/oss-harmony/harmony",
-  "https://github.com/smg-project/llm-multimodal",
+  "https://github.com/smg-project/smg",
+  "https://github.com/vllm-project/rust-pcre2",
   "https://github.com/vllm-project/vllm",
   "https://github.com/zeromq/zmq.rs",
 ]
